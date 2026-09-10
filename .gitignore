@@ -1,0 +1,11 @@
+# Windows
+Thumbs.db
+desktop.ini
+
+# Editors
+.vscode/
+.idea/
+
+# Local scratch
+*.log
+*.lnk
