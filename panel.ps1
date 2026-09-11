@@ -59,6 +59,7 @@ public class PanelNative {
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
     [DllImport("kernel32.dll")] public static extern uint GetConsoleProcessList(uint[] buffer, uint count);
+    [DllImport("dwmapi.dll")] public static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
 }
 '@
 }
@@ -339,216 +340,420 @@ function Start-Mirror {
     return $proc
 }
 
+# --------------------------------------------------------------------- theme
+
+function Get-Theme {
+    # Follows the system setting. AppsUseLightTheme missing means light.
+    $dark = $false
+    try {
+        $key = Get-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' `
+            -Name AppsUseLightTheme -ErrorAction Stop
+        $dark = ($key.AppsUseLightTheme -eq 0)
+    } catch { }
+
+    # The user's accent colour, so the primary button matches the rest of Windows.
+    $accent = [System.Drawing.Color]::FromArgb(0, 120, 212)
+    try {
+        $dwm = Get-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\DWM' -Name ColorizationColor -ErrorAction Stop
+        $raw = [uint32]$dwm.ColorizationColor
+        $accent = [System.Drawing.Color]::FromArgb(
+            [int](($raw -shr 16) -band 0xFF), [int](($raw -shr 8) -band 0xFF), [int]($raw -band 0xFF))
+    } catch { }
+
+    $shift = {
+        param($c, $amount)
+        $f = { param($v, $a) [Math]::Max(0, [Math]::Min(255, $v + $a)) }
+        [System.Drawing.Color]::FromArgb((& $f $c.R $amount), (& $f $c.G $amount), (& $f $c.B $amount))
+    }
+
+    if ($dark) {
+        return @{
+            Dark        = $true
+            Window      = [System.Drawing.Color]::FromArgb(32, 32, 32)
+            Card        = [System.Drawing.Color]::FromArgb(43, 43, 43)
+            Border      = [System.Drawing.Color]::FromArgb(58, 58, 58)
+            Text        = [System.Drawing.Color]::FromArgb(244, 244, 244)
+            TextDim     = [System.Drawing.Color]::FromArgb(155, 155, 155)
+            Button      = [System.Drawing.Color]::FromArgb(56, 56, 56)
+            ButtonHover = [System.Drawing.Color]::FromArgb(70, 70, 70)
+            ButtonDown  = [System.Drawing.Color]::FromArgb(48, 48, 48)
+            Field       = [System.Drawing.Color]::FromArgb(56, 56, 56)
+            Accent      = $accent
+            AccentHover = (& $shift $accent 22)
+            AccentDown  = (& $shift $accent -22)
+            AccentText  = [System.Drawing.Color]::White
+            Ok          = [System.Drawing.Color]::FromArgb(108, 203, 95)
+            Warn        = [System.Drawing.Color]::FromArgb(255, 184, 108)
+            Bad         = [System.Drawing.Color]::FromArgb(255, 107, 107)
+        }
+    }
+    return @{
+        Dark        = $false
+        Window      = [System.Drawing.Color]::FromArgb(243, 243, 243)
+        Card        = [System.Drawing.Color]::White
+        Border      = [System.Drawing.Color]::FromArgb(223, 223, 223)
+        Text        = [System.Drawing.Color]::FromArgb(26, 26, 26)
+        TextDim     = [System.Drawing.Color]::FromArgb(100, 100, 100)
+        Button      = [System.Drawing.Color]::FromArgb(251, 251, 251)
+        ButtonHover = [System.Drawing.Color]::FromArgb(240, 240, 240)
+        ButtonDown  = [System.Drawing.Color]::FromArgb(230, 230, 230)
+        Field       = [System.Drawing.Color]::White
+        Accent      = $accent
+        AccentHover = (& $shift $accent 18)
+        AccentDown  = (& $shift $accent -18)
+        AccentText  = [System.Drawing.Color]::White
+        Ok          = [System.Drawing.Color]::FromArgb(16, 124, 16)
+        Warn        = [System.Drawing.Color]::FromArgb(157, 93, 0)
+        Bad         = [System.Drawing.Color]::FromArgb(196, 43, 28)
+    }
+}
+
+function Set-DarkTitleBar {
+    param($Form, [bool]$Dark)
+    # DWMWA_USE_IMMERSIVE_DARK_MODE. Silently ignored on builds that predate it.
+    try {
+        $value = 0
+        if ($Dark) { $value = 1 }
+        [void][PanelNative]::DwmSetWindowAttribute($Form.Handle, 20, [ref]$value, 4)
+    } catch { }
+}
+
+# Panels and forms are not double buffered by default, so the background, the
+# painted border and every child are drawn in separate passes - visible as
+# flicker while the window builds up. The property is protected, hence reflection.
+function Set-DoubleBuffered {
+    param($Control)
+    try {
+        $prop = [System.Windows.Forms.Control].GetProperty(
+            'DoubleBuffered', [System.Reflection.BindingFlags]'Instance,NonPublic')
+        $prop.SetValue($Control, $true, $null)
+    } catch { }
+}
+
+function New-Card {
+    param($Theme, [int]$X, [int]$Y, [int]$W, [int]$H)
+    $card           = New-Object System.Windows.Forms.Panel
+    Set-DoubleBuffered $card
+    $card.Location  = New-Object System.Drawing.Point($X, $Y)
+    $card.Size      = New-Object System.Drawing.Size($W, $H)
+    $card.BackColor = $Theme.Card
+    $border         = $Theme.Border
+    $card.Add_Paint({
+        param($sender, $e)
+        $pen = New-Object System.Drawing.Pen($border)
+        $e.Graphics.DrawRectangle($pen, 0, 0, $sender.Width - 1, $sender.Height - 1)
+        $pen.Dispose()
+    }.GetNewClosure())
+    return $card
+}
+
+function New-SectionLabel {
+    param($Theme, [string]$Text, [int]$X, [int]$Y)
+    $label           = New-Object System.Windows.Forms.Label
+    $label.Text      = $Text.ToUpper()
+    $label.Location  = New-Object System.Drawing.Point($X, $Y)
+    $label.Size      = New-Object System.Drawing.Size(300, 16)
+    $label.ForeColor = $Theme.TextDim
+    $label.Font      = New-Object System.Drawing.Font('Segoe UI', 7.5, [System.Drawing.FontStyle]::Bold)
+    $label.BackColor = [System.Drawing.Color]::Transparent
+    return $label
+}
+
+# A DropDownList ComboBox always paints its closed state with the system theme,
+# which leaves a white box sitting on a dark card no matter what BackColor or
+# owner drawing say. A flat button with a menu is fully themeable instead.
+# The chosen value lives in .Tag; .Text carries it plus a chevron.
+function New-ThemedDropdown {
+    param($Theme, [int]$X, [int]$Y, [int]$W, [string[]]$Items, [string]$Initial)
+
+    $button           = New-FlatButton $Theme '' $X $Y $W 26
+    $button.TextAlign = 'MiddleLeft'
+    $button.Padding   = New-Object System.Windows.Forms.Padding(8, 0, 0, 0)
+
+    $menu                 = New-Object System.Windows.Forms.ContextMenuStrip
+    $menu.ShowImageMargin = $false
+    $menu.BackColor       = $Theme.Field
+    $menu.ForeColor       = $Theme.Text
+
+    $chevron = [string][char]0x25BE
+
+    foreach ($entry in $Items) {
+        $item           = New-Object System.Windows.Forms.ToolStripMenuItem($entry)
+        $item.BackColor = $Theme.Field
+        $item.ForeColor = $Theme.Text
+        $item.Add_Click({
+            param($sender, $e)
+            $button.Tag  = $sender.Text
+            $button.Text = "$($sender.Text)   $chevron"
+        }.GetNewClosure())
+        [void]$menu.Items.Add($item)
+    }
+
+    $button.Add_Click({ $menu.Show($button, 0, $button.Height) }.GetNewClosure())
+    # Also hung off the control so right-click works and tests can reach the items.
+    $button.ContextMenuStrip = $menu
+
+    $value = $Initial
+    if (-not $value) { $value = $Items[0] }
+    $button.Tag  = $value
+    $button.Text = "$value   $chevron"
+    return $button
+}
+
+function New-FlatButton {
+    param($Theme, [string]$Text, [int]$X, [int]$Y, [int]$W, [int]$H, [switch]$Primary, [string]$FontName = 'Segoe UI', [single]$FontSize = 9)
+    $button          = New-Object System.Windows.Forms.Button
+    $button.Text     = $Text
+    $button.Location = New-Object System.Drawing.Point($X, $Y)
+    $button.Size     = New-Object System.Drawing.Size($W, $H)
+    $button.FlatStyle = 'Flat'
+    $button.Font      = New-Object System.Drawing.Font($FontName, $FontSize)
+    $button.Cursor    = [System.Windows.Forms.Cursors]::Hand
+    $button.UseVisualStyleBackColor = $false
+    if ($Primary) {
+        $button.BackColor = $Theme.Accent
+        $button.ForeColor = $Theme.AccentText
+        $button.FlatAppearance.BorderSize          = 0
+        $button.FlatAppearance.MouseOverBackColor  = $Theme.AccentHover
+        $button.FlatAppearance.MouseDownBackColor  = $Theme.AccentDown
+    } else {
+        $button.BackColor = $Theme.Button
+        $button.ForeColor = $Theme.Text
+        $button.FlatAppearance.BorderSize          = 1
+        $button.FlatAppearance.BorderColor         = $Theme.Border
+        $button.FlatAppearance.MouseOverBackColor  = $Theme.ButtonHover
+        $button.FlatAppearance.MouseDownBackColor  = $Theme.ButtonDown
+    }
+    return $button
+}
+
 # --------------------------------------------------------------------- UI
 
 function New-Panel {
+    $t = Get-Theme
+
     $form                 = New-Object System.Windows.Forms.Form
     $form.Text            = 'Android Control Panel'
-    $form.ClientSize      = New-Object System.Drawing.Size(470, 545)
     $form.FormBorderStyle = 'FixedSingle'
     $form.MaximizeBox     = $false
     $form.StartPosition   = 'CenterScreen'
     $form.Font            = New-Object System.Drawing.Font('Segoe UI', 9)
+    $form.BackColor       = $t.Window
+    $form.ForeColor       = $t.Text
+    Set-DoubleBuffered $form
+    # Invisible until the first paint is through. Child controls are separate
+    # windows that paint themselves only once the message loop gets around to
+    # them, so a window shown right away stands there with white unpainted
+    # rectangles for a moment. The boot timer below turns it visible again -
+    # it can only fire once the queue, paints included, has run dry.
+    $form.Opacity = 0
 
-    # -- status bar ------------------------------------------------------
-    $status              = New-Object System.Windows.Forms.Label
-    $status.Text         = '  Starting ...'
-    $status.AutoSize     = $false
-    $status.Size         = New-Object System.Drawing.Size(454, 22)
-    $status.Location     = New-Object System.Drawing.Point(8, 516)
-    $status.TextAlign    = 'MiddleLeft'
-    $status.BorderStyle  = 'Fixed3D'
+    $pad   = 16
+    $inner = 420                      # card width
+    $y     = 14
+
+    # ---------------------------------------------------------- device card
+    $cardDevice = New-Card $t $pad $y $inner 78
+    $form.Controls.Add($cardDevice)
+
+    $dotState = @{ Color = $t.TextDim }
+    $dot            = New-Object System.Windows.Forms.Panel
+    $dot.Location   = New-Object System.Drawing.Point(16, 26)
+    $dot.Size       = New-Object System.Drawing.Size(10, 10)
+    $dot.BackColor  = $t.Card
+    $dot.Add_Paint({
+        param($sender, $e)
+        $e.Graphics.SmoothingMode = 'AntiAlias'
+        $brush = New-Object System.Drawing.SolidBrush($dotState.Color)
+        $e.Graphics.FillEllipse($brush, 0, 0, 9, 9)
+        $brush.Dispose()
+    }.GetNewClosure())
+    $cardDevice.Controls.Add($dot)
+
+    $lblDevice           = New-Object System.Windows.Forms.Label
+    $lblDevice.Location  = New-Object System.Drawing.Point(34, 18)
+    $lblDevice.Size      = New-Object System.Drawing.Size(300, 24)
+    $lblDevice.Font      = New-Object System.Drawing.Font('Segoe UI Semibold', 11)
+    $lblDevice.ForeColor = $t.Text
+    $lblDevice.BackColor = [System.Drawing.Color]::Transparent
+    $cardDevice.Controls.Add($lblDevice)
+
+    $lblSerial           = New-Object System.Windows.Forms.Label
+    $lblSerial.Location  = New-Object System.Drawing.Point(34, 44)
+    $lblSerial.Size      = New-Object System.Drawing.Size(320, 20)
+    $lblSerial.ForeColor = $t.TextDim
+    $lblSerial.Font      = New-Object System.Drawing.Font('Segoe UI', 8.5)
+    $lblSerial.BackColor = [System.Drawing.Color]::Transparent
+    $cardDevice.Controls.Add($lblSerial)
+
+    # Glyph-only button, so the icon font does not affect any label text.
+    $btnRefresh = New-FlatButton $t ([char]0xE72C) 366 24 38 30 -FontName 'Segoe MDL2 Assets' -FontSize 10
+    $cardDevice.Controls.Add($btnRefresh)
+
+    $y += 78 + 18
+
+    # ---------------------------------------------------------- mirror card
+    $form.Controls.Add((New-SectionLabel $t 'Mirror' ($pad + 2) $y))
+    $y += 18
+    $cardMirror = New-Card $t $pad $y $inner 126
+    $form.Controls.Add($cardMirror)
+
+    $lblSize           = New-Object System.Windows.Forms.Label
+    $lblSize.Text      = 'Max size'
+    $lblSize.Location  = New-Object System.Drawing.Point(16, 22)
+    $lblSize.Size      = New-Object System.Drawing.Size(58, 20)
+    $lblSize.ForeColor = $t.TextDim
+    $lblSize.BackColor = [System.Drawing.Color]::Transparent
+    $cardMirror.Controls.Add($lblSize)
+
+    $sizeInitial = 'Original'
+    if ($MaxSize -gt 0) { $sizeInitial = [string]$MaxSize }
+    $cmbSize = New-ThemedDropdown $t 78 18 108 @('Original', '1920', '1280', '1024', '800') $sizeInitial
+    $cardMirror.Controls.Add($cmbSize)
+
+    $lblFps           = New-Object System.Windows.Forms.Label
+    $lblFps.Text      = 'Max FPS'
+    $lblFps.Location  = New-Object System.Drawing.Point(214, 22)
+    $lblFps.Size      = New-Object System.Drawing.Size(56, 20)
+    $lblFps.ForeColor = $t.TextDim
+    $lblFps.BackColor = [System.Drawing.Color]::Transparent
+    $cardMirror.Controls.Add($lblFps)
+
+    $cmbFps = New-ThemedDropdown $t 274 18 90 @('60', '30', '24') ([string]$Fps)
+    $cardMirror.Controls.Add($cmbFps)
+
+    $chkAwake           = New-Object System.Windows.Forms.CheckBox
+    $chkAwake.Text      = 'Keep device awake'
+    $chkAwake.Location  = New-Object System.Drawing.Point(16, 54)
+    $chkAwake.Size      = New-Object System.Drawing.Size(170, 24)
+    $chkAwake.Checked   = $true
+    $chkAwake.ForeColor = $t.Text
+    # No FlatStyle Flat here: in dark mode that draws an empty white box with no
+    # visible tick. The system renderer shows the state properly.
+    $chkAwake.BackColor = [System.Drawing.Color]::Transparent
+    $cardMirror.Controls.Add($chkAwake)
+
+    $chkScreenOff           = New-Object System.Windows.Forms.CheckBox
+    $chkScreenOff.Text      = 'Phone screen off'
+    $chkScreenOff.Location  = New-Object System.Drawing.Point(214, 54)
+    $chkScreenOff.Size      = New-Object System.Drawing.Size(170, 24)
+    $chkScreenOff.Checked   = [bool]$ScreenOff
+    $chkScreenOff.ForeColor = $t.Text
+    $chkScreenOff.BackColor = [System.Drawing.Color]::Transparent
+    $cardMirror.Controls.Add($chkScreenOff)
+
+    $btnMirror = New-FlatButton $t 'Start mirroring' 16 84 388 32 -Primary -FontSize 9.5
+    $cardMirror.Controls.Add($btnMirror)
+
+    $y += 126 + 18
+
+    # --------------------------------------------------------- capture card
+    $form.Controls.Add((New-SectionLabel $t 'Capture' ($pad + 2) $y))
+    $y += 18
+    $cardCapture = New-Card $t $pad $y $inner 86
+    $form.Controls.Add($cardCapture)
+
+    $btnShot   = New-FlatButton $t 'Screenshot'     16  18 120 32
+    $btnRec    = New-FlatButton $t 'Start recording' 144 18 120 32
+    $btnFolder = New-FlatButton $t 'Open folder'    272 18 120 32
+    $cardCapture.Controls.AddRange(@($btnShot, $btnRec, $btnFolder))
+
+    $lblCapture           = New-Object System.Windows.Forms.Label
+    $lblCapture.Location  = New-Object System.Drawing.Point(16, 56)
+    $lblCapture.Size      = New-Object System.Drawing.Size(388, 18)
+    $lblCapture.ForeColor = $t.TextDim
+    $lblCapture.Font      = New-Object System.Drawing.Font('Segoe UI', 8)
+    $lblCapture.BackColor = [System.Drawing.Color]::Transparent
+    $lblCapture.Text      = 'Saved to Pictures\AndroidMirror. Recording stops by itself after 3 min.'
+    $cardCapture.Controls.Add($lblCapture)
+
+    $y += 86 + 18
+
+    # -------------------------------------------------------- wireless card
+    $form.Controls.Add((New-SectionLabel $t 'Wireless' ($pad + 2) $y))
+    $y += 18
+    $cardWireless = New-Card $t $pad $y $inner 86
+    $form.Controls.Add($cardWireless)
+
+    $btnWireless = New-FlatButton $t 'Go wireless'      16  18 184 32
+    $btnUsb      = New-FlatButton $t 'Back to USB only' 220 18 184 32
+    $cardWireless.Controls.AddRange(@($btnWireless, $btnUsb))
+
+    $lblWireless           = New-Object System.Windows.Forms.Label
+    $lblWireless.Location  = New-Object System.Drawing.Point(16, 56)
+    $lblWireless.Size      = New-Object System.Drawing.Size(388, 18)
+    $lblWireless.ForeColor = $t.TextDim
+    $lblWireless.Font      = New-Object System.Drawing.Font('Segoe UI', 8)
+    $lblWireless.BackColor = [System.Drawing.Color]::Transparent
+    $lblWireless.Text      = 'Leaves a debugging port open on your network until reboot.'
+    $cardWireless.Controls.Add($lblWireless)
+
+    $y += 86 + 18
+
+    # ----------------------------------------------------- maintenance card
+    $form.Controls.Add((New-SectionLabel $t 'Maintenance' ($pad + 2) $y))
+    $y += 18
+    $cardMaint = New-Card $t $pad $y $inner 64
+    $form.Controls.Add($cardMaint)
+
+    $btnUpdate = New-FlatButton $t 'Check for scrcpy update' 16  16 184 32
+    $btnApk    = New-FlatButton $t 'Install APK ...'         220 16 184 32
+    $cardMaint.Controls.AddRange(@($btnUpdate, $btnApk))
+
+    $y += 64 + 14
+
+    # ------------------------------------------------------------- statusbar
+    $status           = New-Object System.Windows.Forms.Label
+    $status.Text      = 'Starting ...'
+    $status.AutoSize  = $false
+    $status.Location  = New-Object System.Drawing.Point(($pad + 2), $y)
+    $status.Size      = New-Object System.Drawing.Size($inner, 20)
+    $status.TextAlign = 'MiddleLeft'
+    $status.ForeColor = $t.Text
+    $status.BackColor = [System.Drawing.Color]::Transparent
     $form.Controls.Add($status)
+
+    $lblVersion           = New-Object System.Windows.Forms.Label
+    $lblVersion.Location  = New-Object System.Drawing.Point(($pad + 2), ($y + 20))
+    $lblVersion.Size      = New-Object System.Drawing.Size($inner, 16)
+    $lblVersion.ForeColor = $t.TextDim
+    $lblVersion.Font      = New-Object System.Drawing.Font('Segoe UI', 7.5)
+    $lblVersion.BackColor = [System.Drawing.Color]::Transparent
+    $lblVersion.AutoEllipsis = $true
+    $form.Controls.Add($lblVersion)
+
+    # Height from the layout rather than a guessed constant: getting this wrong
+    # silently clips the last card and the status line off the bottom.
+    $form.ClientSize = New-Object System.Drawing.Size(($inner + 2 * $pad), ($y + 44))
+
+    # ------------------------------------------------------------ behaviour
 
     # One shared bag for everything the handlers touch. Closures capture variables
     # by value, so a hashtable reference is what makes mutations visible to all of
     # them; plain $script: variables would land in each closure's own module.
     $ui = @{
         Status           = $status
+        Theme            = $t
         Busy             = $false
         AutoStartPending = [bool]$StartMirror
+        Buttons          = @{
+            Refresh = $btnRefresh; Mirror = $btnMirror; Shot = $btnShot; Rec = $btnRec
+            Folder  = $btnFolder;  Wireless = $btnWireless; Usb = $btnUsb
+            Update  = $btnUpdate;  Apk = $btnApk
+        }
+        Combos = @{ Size = $cmbSize; Fps = $cmbFps }
+        Checks = @{ Awake = $chkAwake; ScreenOff = $chkScreenOff }
     }
 
     # Must be a closure itself: a plain scriptblock resolves its variables in
     # whatever scope invokes it, and would not find $status from a handler.
     $setStatus = {
         param([string]$Text, $Color)
-        if ($null -eq $Color) { $Color = [System.Drawing.SystemColors]::ControlText }
-        $ui.Status.Text      = "  $Text"
+        if ($null -eq $Color) { $Color = $ui.Theme.Text }
+        $ui.Status.Text      = $Text
         $ui.Status.ForeColor = $Color
         $ui.Status.Refresh()
     }.GetNewClosure()
-
-    # -- device ----------------------------------------------------------
-    $grpDevice          = New-Object System.Windows.Forms.GroupBox
-    $grpDevice.Text     = ' Device '
-    $grpDevice.Location = New-Object System.Drawing.Point(8, 6)
-    $grpDevice.Size     = New-Object System.Drawing.Size(454, 78)
-    $form.Controls.Add($grpDevice)
-
-    $lblDevice          = New-Object System.Windows.Forms.Label
-    $lblDevice.Location = New-Object System.Drawing.Point(12, 22)
-    $lblDevice.Size     = New-Object System.Drawing.Size(320, 20)
-    $lblDevice.Font     = New-Object System.Drawing.Font('Segoe UI', 10, [System.Drawing.FontStyle]::Bold)
-    $grpDevice.Controls.Add($lblDevice)
-
-    $lblSerial           = New-Object System.Windows.Forms.Label
-    $lblSerial.Location  = New-Object System.Drawing.Point(12, 46)
-    $lblSerial.Size      = New-Object System.Drawing.Size(320, 20)
-    $lblSerial.ForeColor = [System.Drawing.SystemColors]::GrayText
-    $grpDevice.Controls.Add($lblSerial)
-
-    $btnRefresh          = New-Object System.Windows.Forms.Button
-    $btnRefresh.Text     = 'Refresh'
-    $btnRefresh.Location = New-Object System.Drawing.Point(344, 30)
-    $btnRefresh.Size     = New-Object System.Drawing.Size(96, 28)
-    $grpDevice.Controls.Add($btnRefresh)
-
-    # -- mirror ----------------------------------------------------------
-    $grpMirror          = New-Object System.Windows.Forms.GroupBox
-    $grpMirror.Text     = ' Mirror '
-    $grpMirror.Location = New-Object System.Drawing.Point(8, 90)
-    $grpMirror.Size     = New-Object System.Drawing.Size(454, 118)
-    $form.Controls.Add($grpMirror)
-
-    $lblSize          = New-Object System.Windows.Forms.Label
-    $lblSize.Text     = 'Max size'
-    $lblSize.Location = New-Object System.Drawing.Point(12, 28)
-    $lblSize.Size     = New-Object System.Drawing.Size(60, 20)
-    $grpMirror.Controls.Add($lblSize)
-
-    $cmbSize               = New-Object System.Windows.Forms.ComboBox
-    $cmbSize.DropDownStyle = 'DropDownList'
-    $cmbSize.Location      = New-Object System.Drawing.Point(76, 24)
-    $cmbSize.Size          = New-Object System.Drawing.Size(110, 24)
-    [void]$cmbSize.Items.AddRange(@('Original', '1920', '1280', '1024', '800'))
-    $cmbSize.SelectedIndex = 0
-    if ($MaxSize -gt 0) {
-        $index = $cmbSize.Items.IndexOf([string]$MaxSize)
-        if ($index -ge 0) { $cmbSize.SelectedIndex = $index }
-    }
-    $grpMirror.Controls.Add($cmbSize)
-
-    $lblFps          = New-Object System.Windows.Forms.Label
-    $lblFps.Text     = 'Max FPS'
-    $lblFps.Location = New-Object System.Drawing.Point(206, 28)
-    $lblFps.Size     = New-Object System.Drawing.Size(58, 20)
-    $grpMirror.Controls.Add($lblFps)
-
-    $cmbFps               = New-Object System.Windows.Forms.ComboBox
-    $cmbFps.DropDownStyle = 'DropDownList'
-    $cmbFps.Location      = New-Object System.Drawing.Point(268, 24)
-    $cmbFps.Size          = New-Object System.Drawing.Size(80, 24)
-    [void]$cmbFps.Items.AddRange(@('60', '30', '24'))
-    $cmbFps.SelectedIndex = 0
-    $fpsIndex = $cmbFps.Items.IndexOf([string]$Fps)
-    if ($fpsIndex -ge 0) { $cmbFps.SelectedIndex = $fpsIndex }
-    $grpMirror.Controls.Add($cmbFps)
-
-    $chkAwake          = New-Object System.Windows.Forms.CheckBox
-    $chkAwake.Text     = 'Keep device awake'
-    $chkAwake.Location = New-Object System.Drawing.Point(14, 56)
-    $chkAwake.Size     = New-Object System.Drawing.Size(170, 22)
-    $chkAwake.Checked  = $true
-    $grpMirror.Controls.Add($chkAwake)
-
-    $chkScreenOff          = New-Object System.Windows.Forms.CheckBox
-    $chkScreenOff.Text     = 'Phone screen off'
-    $chkScreenOff.Location = New-Object System.Drawing.Point(206, 56)
-    $chkScreenOff.Size     = New-Object System.Drawing.Size(170, 22)
-    $chkScreenOff.Checked  = [bool]$ScreenOff
-    $grpMirror.Controls.Add($chkScreenOff)
-
-    $btnMirror          = New-Object System.Windows.Forms.Button
-    $btnMirror.Text     = 'Start mirroring'
-    $btnMirror.Location = New-Object System.Drawing.Point(12, 82)
-    $btnMirror.Size     = New-Object System.Drawing.Size(428, 30)
-    $grpMirror.Controls.Add($btnMirror)
-
-    # -- capture ---------------------------------------------------------
-    $grpCapture          = New-Object System.Windows.Forms.GroupBox
-    $grpCapture.Text     = ' Capture '
-    $grpCapture.Location = New-Object System.Drawing.Point(8, 214)
-    $grpCapture.Size     = New-Object System.Drawing.Size(454, 92)
-    $form.Controls.Add($grpCapture)
-
-    $btnShot          = New-Object System.Windows.Forms.Button
-    $btnShot.Text     = 'Screenshot'
-    $btnShot.Location = New-Object System.Drawing.Point(12, 24)
-    $btnShot.Size     = New-Object System.Drawing.Size(136, 30)
-    $grpCapture.Controls.Add($btnShot)
-
-    $btnRec          = New-Object System.Windows.Forms.Button
-    $btnRec.Text     = 'Start recording'
-    $btnRec.Location = New-Object System.Drawing.Point(158, 24)
-    $btnRec.Size     = New-Object System.Drawing.Size(136, 30)
-    $grpCapture.Controls.Add($btnRec)
-
-    $btnFolder          = New-Object System.Windows.Forms.Button
-    $btnFolder.Text     = 'Open folder'
-    $btnFolder.Location = New-Object System.Drawing.Point(304, 24)
-    $btnFolder.Size     = New-Object System.Drawing.Size(136, 30)
-    $grpCapture.Controls.Add($btnFolder)
-
-    $lblCapture           = New-Object System.Windows.Forms.Label
-    $lblCapture.Location  = New-Object System.Drawing.Point(12, 60)
-    $lblCapture.Size      = New-Object System.Drawing.Size(428, 20)
-    $lblCapture.ForeColor = [System.Drawing.SystemColors]::GrayText
-    $lblCapture.Text      = 'Saved to Pictures\AndroidMirror. Recording stops by itself after 3 min.'
-    $grpCapture.Controls.Add($lblCapture)
-
-    # -- wireless --------------------------------------------------------
-    $grpWireless          = New-Object System.Windows.Forms.GroupBox
-    $grpWireless.Text     = ' Wireless '
-    $grpWireless.Location = New-Object System.Drawing.Point(8, 312)
-    $grpWireless.Size     = New-Object System.Drawing.Size(454, 92)
-    $form.Controls.Add($grpWireless)
-
-    $btnWireless          = New-Object System.Windows.Forms.Button
-    $btnWireless.Text     = 'Go wireless'
-    $btnWireless.Location = New-Object System.Drawing.Point(12, 24)
-    $btnWireless.Size     = New-Object System.Drawing.Size(210, 30)
-    $grpWireless.Controls.Add($btnWireless)
-
-    $btnUsb          = New-Object System.Windows.Forms.Button
-    $btnUsb.Text     = 'Back to USB only'
-    $btnUsb.Location = New-Object System.Drawing.Point(230, 24)
-    $btnUsb.Size     = New-Object System.Drawing.Size(210, 30)
-    $grpWireless.Controls.Add($btnUsb)
-
-    $lblWireless           = New-Object System.Windows.Forms.Label
-    $lblWireless.Location  = New-Object System.Drawing.Point(12, 60)
-    $lblWireless.Size      = New-Object System.Drawing.Size(428, 20)
-    $lblWireless.ForeColor = [System.Drawing.SystemColors]::GrayText
-    $lblWireless.Text      = 'Leaves a debugging port open on your network until reboot.'
-    $grpWireless.Controls.Add($lblWireless)
-
-    # -- maintenance -----------------------------------------------------
-    $grpMaint          = New-Object System.Windows.Forms.GroupBox
-    $grpMaint.Text     = ' Maintenance '
-    $grpMaint.Location = New-Object System.Drawing.Point(8, 410)
-    $grpMaint.Size     = New-Object System.Drawing.Size(454, 68)
-    $form.Controls.Add($grpMaint)
-
-    $btnUpdate          = New-Object System.Windows.Forms.Button
-    $btnUpdate.Text     = 'Check for scrcpy update'
-    $btnUpdate.Location = New-Object System.Drawing.Point(12, 24)
-    $btnUpdate.Size     = New-Object System.Drawing.Size(210, 30)
-    $grpMaint.Controls.Add($btnUpdate)
-
-    $btnApk          = New-Object System.Windows.Forms.Button
-    $btnApk.Text     = 'Install APK ...'
-    $btnApk.Location = New-Object System.Drawing.Point(230, 24)
-    $btnApk.Size     = New-Object System.Drawing.Size(210, 30)
-    $grpMaint.Controls.Add($btnApk)
-
-    $lblVersion           = New-Object System.Windows.Forms.Label
-    $lblVersion.Location  = New-Object System.Drawing.Point(8, 486)
-    $lblVersion.Size      = New-Object System.Drawing.Size(454, 20)
-    $lblVersion.ForeColor = [System.Drawing.SystemColors]::GrayText
-    $form.Controls.Add($lblVersion)
-
-    # -- behaviour -------------------------------------------------------
 
     $deviceButtons = @($btnMirror, $btnShot, $btnRec, $btnWireless, $btnUsb, $btnApk)
 
@@ -557,22 +762,30 @@ function New-Panel {
         $info = Get-DeviceInfo
         if ($info.Ready) {
             $battery = ''
-            if ($null -ne $info.Battery) { $battery = "  -  $($info.Battery)%" }
-            $lblDevice.Text      = "$($info.Model)  -  Android $($info.Android)$battery"
-            $lblDevice.ForeColor = [System.Drawing.Color]::FromArgb(0, 120, 60)
+            if ($null -ne $info.Battery) { $battery = "   $($info.Battery)%" }
+            $lblDevice.Text  = $info.Model
+            $dotState.Color  = $ui.Theme.Ok
             $extra = ''
-            if ($info.Count -gt 1) { $extra = "   ($($info.Count) devices, using this one)" }
-            $lblSerial.Text = "$($info.Serial)$extra"
+            if ($info.Count -gt 1) { $extra = "   -   $($info.Count) devices, using this one" }
+            $lblSerial.Text = "Android $($info.Android)$battery   -   $($info.Serial)$extra"
             foreach ($b in $deviceButtons) { $b.Enabled = $true }
         } else {
             $text = 'No device connected'
-            if ($info.Status -eq 'unauthorized') { $text = 'Device attached but not authorised' }
-            if ($info.Status -eq 'offline')      { $text = 'Device offline - replug the cable' }
-            $lblDevice.Text      = $text
-            $lblDevice.ForeColor = [System.Drawing.Color]::FromArgb(170, 60, 0)
-            $lblSerial.Text      = 'Enable USB debugging and confirm the prompt on the phone.'
+            $dotState.Color = $ui.Theme.Bad
+            if ($info.Status -eq 'unauthorized') {
+                $text = 'Not authorised'
+                $dotState.Color = $ui.Theme.Warn
+            }
+            if ($info.Status -eq 'offline') { $text = 'Device offline' }
+            $lblDevice.Text = $text
+            $lblSerial.Text = 'Enable USB debugging and confirm the prompt on the phone.'
             foreach ($b in $deviceButtons) { $b.Enabled = $false }
         }
+        $dot.Invalidate()
+        # Draw the card now instead of leaving it to the message loop: the caller
+        # goes on to block for seconds (auto start waits for scrcpy), and the
+        # freshly set model and serial would sit there unpainted until it returns.
+        $cardDevice.Refresh()
         # A running recording must stay stoppable even if the device blips.
         if (Test-RecordingActive) { $btnRec.Enabled = $true }
     }.GetNewClosure()
@@ -586,7 +799,7 @@ function New-Panel {
         try {
             & $Work
         } catch {
-            & $setStatus "Failed: $($_.Exception.Message)" ([System.Drawing.Color]::FromArgb(170, 30, 30))
+            & $setStatus "Failed: $($_.Exception.Message)" $ui.Theme.Bad
         } finally {
             $form.Cursor = [System.Windows.Forms.Cursors]::Default
             $ui.Busy = $false
@@ -600,8 +813,8 @@ function New-Panel {
     $btnMirror.Add_Click({
         & $runGuarded {
             $size = 0
-            if ($cmbSize.SelectedItem -ne 'Original') { $size = [int]$cmbSize.SelectedItem }
-            Start-Mirror -MaxSize $size -Fps ([int]$cmbFps.SelectedItem) `
+            if ($cmbSize.Tag -ne 'Original') { $size = [int]$cmbSize.Tag }
+            Start-Mirror -MaxSize $size -Fps ([int]$cmbFps.Tag) `
                 -StayAwake:$chkAwake.Checked -ScreenOff:$chkScreenOff.Checked | Out-Null
             & $setStatus 'scrcpy started.' $null
         } 'Starting scrcpy ...'
@@ -625,7 +838,7 @@ function New-Panel {
             & $runGuarded {
                 Start-Recording | Out-Null
                 $btnRec.Text = 'Stop recording'
-                & $setStatus 'Recording ...' ([System.Drawing.Color]::FromArgb(170, 30, 30))
+                & $setStatus 'Recording ...' $ui.Theme.Bad
             } 'Starting recording ...'
         }
     }.GetNewClosure())
@@ -674,7 +887,7 @@ function New-Panel {
             if ($answer -ne 'Yes') { & $setStatus 'Update skipped.' $null; return }
             & $setStatus 'Installing update ...' $null
             Install-ScrcpyUpdate
-            $lblVersion.Text = "  scrcpy: $(Get-ScrcpyPath)"
+            $lblVersion.Text = Get-ScrcpyPath
             & $setStatus 'Update installed.' $null
         } 'Checking for updates ...'
     }.GetNewClosure())
@@ -704,8 +917,22 @@ function New-Panel {
     $timer.Interval = 4000
     $timer.Add_Tick({ & $refresh; & $tryAutoStart }.GetNewClosure())
 
-    $form.Add_Shown({
-        $lblVersion.Text = "  scrcpy: $(Get-ScrcpyPath)"
+    # Startup blocks for seconds: Get-DeviceInfo makes four adb round trips, and
+    # -StartMirror then waits for scrcpy's window to exist. Doing that straight
+    # from Shown means it all runs before the form has ever painted, and the
+    # window sits there with white unpainted rectangles until it is over. A
+    # one-shot timer hands control back to the message loop first - WM_PAINT is
+    # dispatched ahead of WM_TIMER - so the window is fully drawn before it
+    # goes busy.
+    $boot          = New-Object System.Windows.Forms.Timer
+    $boot.Interval = 1
+    $boot.Add_Tick({
+        $boot.Stop()
+        # First statement, before anything that could throw: a form left at
+        # opacity 0 would be invisible for good.
+        $form.Opacity    = 1
+        $form.Cursor     = [System.Windows.Forms.Cursors]::WaitCursor
+        $lblVersion.Text = Get-ScrcpyPath
         & $refresh
         if ($ui.AutoStartPending -and -not (Get-CurrentSerial)) {
             & $setStatus 'Waiting for a device, then mirroring starts by itself ...' $null
@@ -714,9 +941,20 @@ function New-Panel {
         }
         $timer.Start()
         & $tryAutoStart
+        $form.Cursor = [System.Windows.Forms.Cursors]::Default
+    }.GetNewClosure())
+
+    # Before the window is visible, otherwise the title bar flashes up white.
+    $form.Add_HandleCreated({ Set-DarkTitleBar $form $ui.Theme.Dark }.GetNewClosure())
+
+    $form.Add_Shown({
+        & $setStatus 'Reading device ...' $null
+        $form.Refresh()
+        $boot.Start()
     }.GetNewClosure())
 
     $form.Add_FormClosing({
+        $boot.Stop()
         $timer.Stop()
         if (Test-RecordingActive) {
             # Do not leave a half-written file sitting on the phone.
@@ -754,23 +992,23 @@ if ($SelfTest) {
 
     Write-Host '--- building the form (not shown) ---' -ForegroundColor Cyan
     $form = New-Panel
-    $groups = @($form.Controls | Where-Object { $_ -is [System.Windows.Forms.GroupBox] })
+    $ui   = $form.Tag
     Write-Host ("form       : '{0}' {1}x{2}" -f $form.Text, $form.ClientSize.Width, $form.ClientSize.Height)
-    Write-Host ("groups     : {0}" -f (($groups | ForEach-Object { $_.Text.Trim() }) -join ', '))
-    $buttons = @()
-    foreach ($g in $groups) {
-        $buttons += @($g.Controls | Where-Object { $_ -is [System.Windows.Forms.Button] } | ForEach-Object { $_.Text })
-    }
-    Write-Host ("buttons    : {0}" -f ($buttons -join ', '))
+    Write-Host ("theme      : {0}   accent #{1:X2}{2:X2}{3:X2}" -f `
+        $(if ($ui.Theme.Dark) { 'dark' } else { 'light' }), $ui.Theme.Accent.R, $ui.Theme.Accent.G, $ui.Theme.Accent.B)
+
+    # Walk the cards rather than GroupBoxes: the layout uses plain panels now.
+    $cards = @($form.Controls | Where-Object { $_ -is [System.Windows.Forms.Panel] })
+    $labels = @($form.Controls | Where-Object { $_ -is [System.Windows.Forms.Label] -and $_.Font.Bold })
+    Write-Host ("sections   : {0}" -f (($labels | ForEach-Object { $_.Text }) -join ', '))
+    Write-Host ("cards      : {0}" -f $cards.Count)
+    Write-Host ("buttons    : {0}" -f (($ui.Buttons.Values | ForEach-Object { $_.Text }) -join ', '))
 
     # Prove the -MaxSize/-Fps/-ScreenOff parameters actually reached the controls.
-    $mirror  = $groups | Where-Object { $_.Text.Trim() -eq 'Mirror' }
-    $combos  = @($mirror.Controls | Where-Object { $_ -is [System.Windows.Forms.ComboBox] })
-    $checks  = @($mirror.Controls | Where-Object { $_ -is [System.Windows.Forms.CheckBox] })
-    $picked  = ($combos | ForEach-Object { $_.SelectedItem }) -join ' / '
-    $ticked  = ($checks | ForEach-Object { "$($_.Text)=$($_.Checked)" }) -join ', '
+    $picked = "$($ui.Combos.Size.Tag) / $($ui.Combos.Fps.Tag)"
+    $ticked = ($ui.Checks.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value.Checked)" }) -join ', '
     Write-Host ("mirror set : $picked   [$ticked]")
-    Write-Host ("auto start : {0}" -f $form.Tag.AutoStartPending)
+    Write-Host ("auto start : {0}" -f $ui.AutoStartPending)
     $form.Dispose()
     Write-Host "OK`n" -ForegroundColor Green
     return

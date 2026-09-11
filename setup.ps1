@@ -60,8 +60,9 @@ if (-not $NoShortcut) {
     $desktop = [Environment]::GetFolderPath('Desktop')
     $shell = New-Object -ComObject WScript.Shell
     $created = 0
+    $wscript = Join-Path $env:SystemRoot 'System32\wscript.exe'
     foreach ($item in @(
-        @{ Name = 'Android Control Panel'; Target = 'panel.vbs' },
+        @{ Name = 'Android Control Panel'; Target = 'panel.vbs'; Via = $wscript },
         @{ Name = 'Android Mirror';        Target = 'mirror.bat' },
         @{ Name = 'Android Mirror (dark)'; Target = 'mirror-dark.bat' }
     )) {
@@ -71,7 +72,15 @@ if (-not $NoShortcut) {
             continue
         }
         $lnk = $shell.CreateShortcut((Join-Path $desktop "$($item.Name).lnk"))
-        $lnk.TargetPath = $target
+        if ($item.Via) {
+            # Explicitly through wscript.exe instead of trusting the .vbs file
+            # association: where cscript is the registered handler, double
+            # clicking would pop up a console window.
+            $lnk.TargetPath = $item.Via
+            $lnk.Arguments  = '"' + $target + '"'
+        } else {
+            $lnk.TargetPath = $target
+        }
         $lnk.WorkingDirectory = $root
         $lnk.Description = 'Mirror an Android device to this PC'
         $lnk.Save()
