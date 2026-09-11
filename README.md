@@ -15,7 +15,7 @@ No app on the phone, no root, no account, no ads.
 | File | Purpose |
 | --- | --- |
 | `setup.ps1` | Installs scrcpy via winget, starts the adb server, creates desktop shortcuts |
-| `mirror.bat` | Waits for a device, then mirrors it |
+| `mirror.bat` | Checks for a scrcpy update, waits for a device, then mirrors it |
 | `mirror-dark.bat` | Same, but keeps the phone screen off while you use it from the PC |
 
 Both launchers pass any extra arguments straight through to scrcpy, so
@@ -75,6 +75,27 @@ screen again — press `Alt+Shift+O` to turn it back off.
 
 Note that a dark screen is not a locked screen. The device is unlocked, just not
 lit.
+
+## Update check
+
+`mirror.bat` checks for a newer scrcpy release on each start and asks before
+installing anything:
+
+```
+  New version available:  4.1  ->  4.2
+  Update now? [Y/N]  (20s, default: No)
+```
+
+Answering `N`, pressing Enter or letting the 20 second timeout expire carries on
+with the installed version, so the launcher never blocks. Answering `Y` runs
+`winget upgrade` and then re-resolves the path, picking up the new version in
+the same run.
+
+The check costs about a second. It deliberately uses `winget list
+--upgrade-available` rather than `winget upgrade`, because the latter would
+install the update immediately instead of asking. Detection keys on the package
+id appearing in the output, not on any message text, so it works regardless of
+the display language.
 
 ## Shortcuts
 
