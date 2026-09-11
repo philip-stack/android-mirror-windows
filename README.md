@@ -17,6 +17,7 @@ No app on the phone, no root, no account, no ads.
 | `setup.ps1` | Installs scrcpy via winget, starts the adb server, creates desktop shortcuts |
 | `mirror.bat` | Checks for a scrcpy update, waits for a device, then mirrors it |
 | `mirror-dark.bat` | Same, but keeps the phone screen off while you use it from the PC |
+| `connect-wireless.bat` | Switches the device to wireless debugging so the cable can go |
 
 Both launchers pass any extra arguments straight through to scrcpy, so
 `mirror.bat --max-size=1024` works.
@@ -87,7 +88,9 @@ installing anything:
 ```
 
 Answering `N`, pressing Enter or letting the 20 second timeout expire carries on
-with the installed version, so the launcher never blocks. Answering `Y` runs
+with the installed version, so the launcher never blocks. Skip the check
+entirely with `--no-update-check`, or by setting `SKIP_UPDATE_CHECK=1` — worth
+doing when there is no network, since winget has to time out first. Answering `Y` runs
 `winget upgrade` and then re-resolves the path, picking up the new version in
 the same run.
 
@@ -135,25 +138,31 @@ device.
 
 ## Wireless
 
-USB is lower latency and needs no setup, so the launchers target it. Wireless is
-a few extra commands.
+USB is lower latency and needs no setup, so the launchers target it. To cut the
+cable, connect over USB once and run:
 
-Enable **Wireless debugging** in Developer options, then pair once:
+```powershell
+.\connect-wireless.bat
+```
+
+It reads the phone's Wi-Fi address, switches adb to TCP/IP on port 5555 and
+connects. After that the cable can go and `mirror.bat` works over Wi-Fi.
+
+Expect noticeably more latency than USB — `--max-size=1024 --max-fps=30` helps.
+Some routers block device-to-device traffic (client isolation), which stops this
+from working at all.
+
+Bear in mind this leaves an adb port open on your network until the phone
+reboots or you run `adb usb`. It is authenticated by the same key as USB
+debugging, but it is still an open debugging port.
+
+For a fully cable-free setup, Android's own **Wireless debugging** pairing works
+too:
 
 ```powershell
 adb pair 192.168.x.x:PORT     # port and code from "Pair device with pairing code"
 adb connect 192.168.x.x:PORT  # port from the Wireless debugging main screen (different port)
-mirror.bat
 ```
-
-Or, while still connected by cable, switch over in one step and unplug:
-
-```powershell
-adb tcpip 5555
-scrcpy --tcpip
-```
-
-Expect noticeably more latency than USB. `--max-size=1024 --max-fps=30` helps.
 
 ## Troubleshooting
 
@@ -165,6 +174,7 @@ Expect noticeably more latency than USB. `--max-size=1024 --max-fps=30` helps.
 | Windows does not detect the phone | Install the Google USB driver: `winget install Google.PlatformTools` |
 | `scrcpy` not found in a new terminal | winget adds it to PATH — open a new shell, or sign out and back in |
 | Laggy over Wi-Fi | Lower `--max-size` and `--max-fps` |
+| "More than one device is connected" | Unplug the others, or pick one with `set ANDROID_SERIAL=<serial>` |
 
 ## Credits
 

@@ -1,9 +1,28 @@
 @echo off
 rem Mirror an Android device to Windows and control it with mouse + keyboard.
+rem
 rem Checks for a newer scrcpy version on each start and offers to install it.
-rem Any extra arguments are passed straight through to scrcpy.
+rem Skip that with --no-update-check or by setting SKIP_UPDATE_CHECK=1, which
+rem also keeps things quick when there is no network.
+rem
+rem Any other argument is passed straight through to scrcpy.
 title Android Screen Mirror
 setlocal enabledelayedexpansion
+
+rem Take the raw command line rather than walking %1/%2: cmd treats "=" as an
+rem argument separator, so shifting would turn --max-size=1024 into two tokens
+rem and scrcpy would see a broken flag.
+set "PASSTHRU=%*"
+set "SKIPCHECK=%SKIP_UPDATE_CHECK%"
+rem The "if defined" guard is not optional: on an UNDEFINED variable cmd expands
+rem !VAR:search=! to the literal search string instead of to nothing, which would
+rem hand scrcpy a bogus --no-update-check argument when called without any.
+if defined PASSTHRU (
+  if not "!PASSTHRU!"=="!PASSTHRU:--no-update-check=!" (
+    set "SKIPCHECK=1"
+    set "PASSTHRU=!PASSTHRU:--no-update-check=!"
+  )
+)
 
 call :resolve_scrcpy
 if not defined SCRCPY (
@@ -16,7 +35,7 @@ if not defined SCRCPY (
   exit /b 1
 )
 
-call :check_update
+if not defined SKIPCHECK call :check_update
 
 echo.
 echo   Waiting for an Android device ...
@@ -25,16 +44,56 @@ echo   "Allow USB debugging?" choose "Always allow" -^> OK
 echo.
 
 "!ADB!" start-server >nul 2>&1
-"!ADB!" wait-for-device
-if errorlevel 1 goto failed
+
+:wait_loop
+call :count_devices
+if !DEVCOUNT! GEQ 1 goto have_device
+rem Polling instead of "adb wait-for-device": that command errors out when more
+rem than one device is attached, and we want to report that properly below.
+timeout /t 1 /nobreak >nul
+goto wait_loop
+
+:have_device
+set "TARGET="
+if !DEVCOUNT! GTR 1 (
+  if not defined ANDROID_SERIAL (
+    echo   More than one device is connected:
+    echo.
+    "!ADB!" devices
+    echo.
+    echo   Pick one before starting, for example:
+    echo     set ANDROID_SERIAL=0123456789ABCDEF
+    echo.
+    pause
+    endlocal
+    exit /b 1
+  )
+) else (
+  rem Be explicit about the target so a device plugged in later cannot confuse us.
+  set "TARGET=-s !SERIAL!"
+)
 
 echo   Device found. Starting mirror ...
 echo.
-"!SCRCPY!" --stay-awake --max-fps=60 %*
+"!SCRCPY!" !TARGET! --stay-awake --max-fps=60 !PASSTHRU!
 if errorlevel 1 goto failed
 
 endlocal
 exit /b 0
+
+
+:count_devices
+rem Counts devices in state "device". Anything else - unauthorized, offline -
+rem is ignored on purpose so the wait loop keeps going until the phone is ready.
+set "DEVCOUNT=0"
+set "SERIAL="
+for /f "skip=1 tokens=1,2" %%a in ('"!ADB!" devices 2^>nul') do (
+  if "%%b"=="device" (
+    set /a DEVCOUNT+=1
+    set "SERIAL=%%a"
+  )
+)
+goto :eof
 
 
 :resolve_scrcpy

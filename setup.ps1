@@ -59,18 +59,26 @@ if (-not $NoShortcut) {
     Write-Step 'Creating desktop shortcuts'
     $desktop = [Environment]::GetFolderPath('Desktop')
     $shell = New-Object -ComObject WScript.Shell
+    $created = 0
     foreach ($item in @(
         @{ Name = 'Android Mirror';      Target = 'mirror.bat' },
         @{ Name = 'Android Mirror (dark)'; Target = 'mirror-dark.bat' }
     )) {
         $target = Join-Path $root $item.Target
-        if (-not (Test-Path $target)) { continue }
+        if (-not (Test-Path $target)) {
+            Write-Host "    skipped $($item.Target) - not found next to setup.ps1" -ForegroundColor Yellow
+            continue
+        }
         $lnk = $shell.CreateShortcut((Join-Path $desktop "$($item.Name).lnk"))
         $lnk.TargetPath = $target
         $lnk.WorkingDirectory = $root
         $lnk.Description = 'Mirror an Android device to this PC'
         $lnk.Save()
         Write-Host "    $($item.Name).lnk"
+        $created++
+    }
+    if ($created -eq 0) {
+        Write-Host '    No shortcuts created. Run setup.ps1 from the cloned repo so the .bat files sit next to it.' -ForegroundColor Yellow
     }
 }
 
