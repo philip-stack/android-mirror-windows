@@ -61,7 +61,8 @@ if (-not $NoShortcut) {
     $shell = New-Object -ComObject WScript.Shell
     $created = 0
     foreach ($item in @(
-        @{ Name = 'Android Mirror';      Target = 'mirror.bat' },
+        @{ Name = 'Android Control Panel'; Target = 'panel.bat' },
+        @{ Name = 'Android Mirror';        Target = 'mirror.bat' },
         @{ Name = 'Android Mirror (dark)'; Target = 'mirror-dark.bat' }
     )) {
         $target = Join-Path $root $item.Target

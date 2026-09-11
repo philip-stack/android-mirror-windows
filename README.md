@@ -15,12 +15,28 @@ No app on the phone, no root, no account, no ads.
 | File | Purpose |
 | --- | --- |
 | `setup.ps1` | Installs scrcpy via winget, starts the adb server, creates desktop shortcuts |
+| `panel.bat` / `panel.ps1` | Control panel window: mirror, screenshot, record, wireless, update |
 | `mirror.bat` | Checks for a scrcpy update, waits for a device, then mirrors it |
 | `mirror-dark.bat` | Same, but keeps the phone screen off while you use it from the PC |
 | `connect-wireless.bat` | Switches the device to wireless debugging so the cable can go |
 
 Both launchers pass any extra arguments straight through to scrcpy, so
 `mirror.bat --max-size=1024` works.
+
+## Control panel
+
+Double-click `panel.bat` for a small window instead of the one-shot launchers:
+
+- live device status (model, Android version, battery), polled every 4 seconds
+- start mirroring with a max size / FPS / screen-off picker
+- screenshot and screen recording, saved to `Pictures\AndroidMirror`
+- switch to wireless debugging and back to USB
+- manual scrcpy update check
+- install an APK by picking the file
+
+It is plain WinForms from PowerShell, so there is nothing extra to install.
+`panel.ps1 -SelfTest` runs the logic and builds the window without showing it,
+which is how the non-visual parts stay testable.
 
 ## Requirements
 
