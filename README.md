@@ -16,6 +16,7 @@ No app on the phone, no root, no account, no ads.
 | --- | --- |
 | `setup.ps1` | Installs scrcpy via winget, starts the adb server, creates desktop shortcuts |
 | `panel.vbs` / `panel.ps1` | Control panel window: mirror, screenshot, record, wireless, update |
+| `docs/panel.png` | The screenshot used in this README |
 | `mirror.bat` | Checks for a scrcpy update, waits for a device, then mirrors it |
 | `mirror-dark.bat` | Same, but keeps the phone screen off while you use it from the PC |
 | `connect-wireless.bat` | Switches the device to wireless debugging so the cable can go |
@@ -25,26 +26,56 @@ Both launchers pass any extra arguments straight through to scrcpy, so
 
 ## Control panel
 
-Double-click `panel.vbs` for a small window instead of the one-shot launchers:
+Double-click `panel.vbs` for a small window instead of the one-shot launchers.
 
-- live device status (model, Android version, battery), polled every 4 seconds
-- start mirroring with a max size / FPS / screen-off picker
-- screenshot and screen recording, saved to `Pictures\AndroidMirror`
+![The control panel](docs/panel.png)
+
+- live device status — model, Android version, battery and phone temperature,
+  amber from 40 °C and red from 45 °C
+- one button that starts and stops mirroring, so there is never more than one
+  mirror window open
+- max size, frame rate and video bit rate pickers, remembered for next time
+- screenshot and recording, saved to `Pictures\AndroidMirror`
 - switch to wireless debugging and back to USB
-- manual scrcpy update check
-- install an APK by picking the file
+- manual scrcpy update check, and installing an APK by picking the file
+- a device picker, shown only when more than one device is attached
 
 It is plain WinForms from PowerShell, so there is nothing extra to install.
 `panel.ps1 -SelfTest` runs the logic and builds the window without showing it,
 which is how the non-visual parts stay testable.
 
 Start it with `-StartMirror` to begin mirroring right away, plus `-ScreenOff`,
-`-MaxSize` and `-Fps` to preselect the options. With `-StartMirror` and no device
-attached the panel waits and starts on its own once one appears:
+`-MaxSize`, `-Fps` and `-BitRate` to preselect the options. Arguments win over
+the remembered selection, so a shortcut always behaves the same way. With
+`-StartMirror` and no device attached the panel waits and starts on its own once
+one appears:
 
 ```powershell
 .\panel.vbs -StartMirror -ScreenOff
 ```
+
+### Recording
+
+Recording is the mirror written to a file: scrcpy's `--record` saves the stream
+it is already sending. No copy back from the phone, no three minute ceiling, and
+it still works when the phone has gone to sleep. Switching recording on or off
+restarts scrcpy, which costs about a second of black window.
+
+### Bit rate
+
+8 Mbit/s is scrcpy's default and the default here. On a 1280x2856 screen that is
+0.036 bits per pixel at 60 fps, which smears while things move — but raising it
+makes the phone's encoder work harder, and in a game that showed up as stalling
+rather than as a sharper picture. Raise it for reading and scrolling, leave it
+for games, or cut the pixel count with a smaller max size, which helps both at
+once.
+
+### Settings and log
+
+Both live in `%APPDATA%\AndroidMirrorPanel`. `settings.json` holds the last used
+selection; `panel.log` records starts, failures and actions — not the polling —
+and keeps one rolled-over generation. The **Open log and settings** button opens
+the folder.
 
 The entry point is a VBScript shim rather than the `.ps1` directly, because that
 is the only way to end up with no console window: `powershell -WindowStyle

@@ -64,12 +64,14 @@ if (-not ([System.Management.Automation.PSTypeName]'PanelNative').Type) {
     Add-Type @'
 using System;
 using System.Runtime.InteropServices;
+public struct PanelRect { public int Left, Top, Right, Bottom; }
 public class PanelNative {
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
     [DllImport("kernel32.dll")] public static extern uint GetConsoleProcessList(uint[] buffer, uint count);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
+    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, ref PanelRect rect);
     [DllImport("dwmapi.dll")] public static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
 }
 '@
@@ -111,13 +113,15 @@ function Request-SingleInstance {
     return $false
 }
 
-$script:Tools        = $null
-$script:Serial       = $null
-$script:RecordRemote = $null
-$script:RecordProc   = $null
-$script:RecordStamp  = $null
-$script:MirrorProc   = $null
-$script:Busy         = $false
+$script:Tools            = $null
+$script:Serial           = $null
+$script:RecordStarted    = $null
+# Set while the scrcpy that is running was started with --record.
+$script:MirrorRecordPath = $null
+$script:MirrorProc       = $null
+$script:Busy             = $false
+# Filled from the saved settings in the main section below.
+$script:StayAwake     = $true
 
 # Per serial: model and Android version, which never change once known.
 $script:DeviceFacts      = @{}
@@ -128,6 +132,48 @@ $script:BatteryStamp     = [DateTime]::MinValue
 # Ten seconds: the charge level does not need it, but the temperature is worth
 # watching while mirroring, and both arrive in the same single adb call.
 $script:BatteryMaxAgeSec = 10
+
+# ------------------------------------------------- settings and log file
+
+# Both live next to each other under %APPDATA%, not beside the script: the repo
+# may sit somewhere read only, and neither belongs in version control.
+function Get-ConfigDir {
+    $dir = Join-Path $env:APPDATA 'AndroidMirrorPanel'
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    return $dir
+}
+
+function Get-SettingsPath { return Join-Path (Get-ConfigDir) 'settings.json' }
+function Get-LogPath      { return Join-Path (Get-ConfigDir) 'panel.log' }
+
+function Read-Settings {
+    $path = Get-SettingsPath
+    if (-not (Test-Path $path)) { return $null }
+    # A damaged file must not stop the panel from opening - fall back to defaults.
+    try { return (Get-Content -Path $path -Raw -ErrorAction Stop | ConvertFrom-Json) }
+    catch { Write-Log "settings unreadable, using defaults: $($_.Exception.Message)"; return $null }
+}
+
+function Write-Settings {
+    param($Settings)
+    try { $Settings | ConvertTo-Json | Set-Content -Path (Get-SettingsPath) -Encoding UTF8 -ErrorAction Stop }
+    catch { Write-Log "settings not saved: $($_.Exception.Message)" }
+}
+
+# Deliberately quiet: starts, stops, failures and user actions, never the poll.
+# When scrcpy misbehaves sporadically there is otherwise nothing left to look at.
+function Write-Log {
+    param([string]$Message)
+    try {
+        $path = Get-LogPath
+        if ((Test-Path $path) -and (Get-Item $path).Length -gt 262144) {
+            # One generation kept, so a long lived install still has some history.
+            Move-Item -Path $path -Destination "$path.1" -Force
+        }
+        Add-Content -Path $path -Encoding UTF8 `
+            -Value ('{0:yyyy-MM-dd HH:mm:ss}  {1}' -f (Get-Date), $Message)
+    } catch { }
+}
 
 # ----------------------------------------------------------------- tooling
 
@@ -277,7 +323,8 @@ function Get-DeviceInfo {
         if ($all.Count -gt 0) { $state = $all[0].State }
         return [pscustomobject]@{
             Ready = $false; Status = $state; Serial = $null
-            Model = $null; Android = $null; Battery = $null; Temperature = $null; Count = $all.Count
+            Model = $null; Android = $null; Battery = $null; Temperature = $null
+            Count = $all.Count; Serials = @()
         }
     }
 
@@ -319,7 +366,8 @@ function Get-DeviceInfo {
     return [pscustomobject]@{
         Ready = $true; Status = 'device'; Serial = $script:Serial
         Model = $facts.Model; Android = $facts.Android
-        Battery = $script:BatteryLevel; Temperature = $script:BatteryTemp; Count = $ready.Count
+        Battery = $script:BatteryLevel; Temperature = $script:BatteryTemp
+        Count = $ready.Count; Serials = @($ready.Serial)
     }
 }
 
@@ -327,8 +375,17 @@ function Get-DeviceInfo {
 # resolves to that module rather than to this file. Script-scope state is therefore
 # read through functions, which do resolve correctly from inside a closure.
 function Get-CurrentSerial { return $script:Serial }
+# Picked by hand from the device list; Get-DeviceInfo keeps it while it is there.
+function Set-CurrentSerial { param([string]$Serial) $script:Serial = $Serial }
 # Pressing Refresh should mean now, not "up to ten seconds ago".
 function Reset-BatteryCache { $script:BatteryStamp = [DateTime]::MinValue }
+
+# screenrecord stops on its own after three minutes, so the figure worth showing
+# is how much of that is gone.
+function Get-RecordingElapsed {
+    if (-not $script:RecordStarted) { return $null }
+    return ([DateTime]::Now - $script:RecordStarted)
+}
 function Reset-CurrentSerial { $script:Serial = $null }
 # Self clearing: once scrcpy is gone - closed from its own window bar, device
 # unplugged, crashed - the handle is dropped and the button goes back to Start.
@@ -337,25 +394,30 @@ function Test-MirrorActive {
     return [bool]$script:MirrorProc
 }
 
+# Returns the recording file when this mirror was recording, so the caller can
+# report it. Empty otherwise.
 function Stop-Mirror {
-    if (-not $script:MirrorProc) { return }
-    if (-not $script:MirrorProc.HasExited) {
+    $recorded = $script:MirrorRecordPath
+    if ($script:MirrorProc -and -not $script:MirrorProc.HasExited) {
         # Close the window rather than killing the process: scrcpy has its own
-        # shutdown to run, and --power-off-on-close only happens on that path.
+        # shutdown to run. --power-off-on-close only happens on that path, and a
+        # recording is only written into a playable container there as well.
         [void]$script:MirrorProc.CloseMainWindow()
-        $deadline = [DateTime]::UtcNow.AddSeconds(5)
+        $deadline = [DateTime]::UtcNow.AddSeconds(8)
         while (-not $script:MirrorProc.HasExited -and [DateTime]::UtcNow -lt $deadline) {
             Wait-Pumped 100
         }
-        if (-not $script:MirrorProc.HasExited) { try { $script:MirrorProc.Kill() } catch { } }
+        if (-not $script:MirrorProc.HasExited) {
+            Write-Log 'scrcpy ignored the close request, killed it'
+            try { $script:MirrorProc.Kill() } catch { }
+        }
     }
-    $script:MirrorProc = $null
+    $script:MirrorProc       = $null
+    $script:MirrorRecordPath = $null
+    $script:RecordStarted    = $null
+    return $recorded
 }
 
-function Test-RecordingActive { return [bool]$script:RecordRemote }
-# True once the adb client has exited, which happens when screenrecord hits its
-# own three minute limit on the device - nobody pressed stop.
-function Test-RecordingFinished { return [bool]($script:RecordProc -and $script:RecordProc.HasExited) }
 function Get-ScrcpyPath { return $script:Tools.Scrcpy }
 
 function Get-DeviceIp {
@@ -375,12 +437,55 @@ function Get-OutputDir {
     return $dir
 }
 
+# Grabs the mirror window off the screen. Lower resolution than the phone's own
+# framebuffer, but it is the only picture that still exists while the phone's
+# display is off - scrcpy captures a virtual display, screencap the physical one.
+function Save-MirrorWindow {
+    param([string]$Path)
+    if (-not (Test-MirrorActive)) { throw 'No mirror window to capture.' }
+    $handle = $script:MirrorProc.MainWindowHandle
+    if ($handle -eq [IntPtr]::Zero) { throw 'The mirror window is not available.' }
+
+    # It has to be uncovered for this, so pull it up first.
+    [void][PanelNative]::ShowWindow($handle, 9)   # SW_RESTORE
+    [void][PanelNative]::SetForegroundWindow($handle)
+    Wait-Pumped 350
+
+    $rect = New-Object PanelRect
+    if (-not [PanelNative]::GetWindowRect($handle, [ref]$rect)) { throw 'Could not measure the mirror window.' }
+    $width  = $rect.Right - $rect.Left
+    $height = $rect.Bottom - $rect.Top
+    if ($width -le 0 -or $height -le 0) { throw 'The mirror window has no size.' }
+
+    $bitmap   = New-Object System.Drawing.Bitmap($width, $height)
+    $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+    $graphics.CopyFromScreen($rect.Left, $rect.Top, 0, 0,
+        (New-Object System.Drawing.Size($width, $height)))
+    $graphics.Dispose()
+    $bitmap.Save($Path, [System.Drawing.Imaging.ImageFormat]::Png)
+    $bitmap.Dispose()
+    return $Path
+}
+
 function Save-Screenshot {
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $local = Join-Path (Get-OutputDir) "screenshot-$stamp.png"
+
+    # screencap reads the physical display. With the screen off that is a black
+    # frame, measured: 20 KB of pure black against 3.2 MB with the screen on, and
+    # the old code saved that without a word. Mirroring switches the screen off,
+    # so this was the normal case.
+    if (-not (Test-DisplayAwake)) {
+        if (Test-MirrorActive) {
+            Write-Log 'screenshot taken from the mirror window, phone display is off'
+            return (Save-MirrorWindow $local)
+        }
+        throw 'The phone display is off, so there is nothing to capture. Start mirroring, or wake the phone.'
+    }
+
     # Through a file on the device rather than "exec-out screencap -p": PowerShell
     # corrupts binary data coming back over a redirected native stdout.
-    $stamp  = Get-Date -Format 'yyyyMMdd-HHmmss'
     $remote = "/sdcard/panel_shot_$stamp.png"
-    $local  = Join-Path (Get-OutputDir) "screenshot-$stamp.png"
     Invoke-AdbTarget @('shell', 'screencap', '-p', $remote) | Out-Null
     Invoke-AdbTarget @('pull', $remote, $local) | Out-Null
     Invoke-AdbTarget @('shell', 'rm', '-f', $remote) | Out-Null
@@ -388,38 +493,40 @@ function Save-Screenshot {
     return $local
 }
 
-function Start-Recording {
-    $script:RecordStamp  = Get-Date -Format 'yyyyMMdd-HHmmss'
-    $script:RecordRemote = "/sdcard/panel_rec_$($script:RecordStamp).mp4"
-    $argList = @()
-    if ($script:Serial) { $argList += @('-s', $script:Serial) }
-    $argList += @('shell', 'screenrecord', '--bit-rate', '8000000', $script:RecordRemote)
-    $script:RecordProc = Start-Hidden -FilePath $script:Tools.Adb -Arguments $argList
-    return $script:RecordRemote
+# The mirror stream is the recording. scrcpy already encodes the screen and sends
+# it over, so --record writes that same stream straight to a file on the PC.
+# screenrecord on the device cannot do this job: it captures the physical
+# display, and a display that is switched off has no layer stack, so it quits
+# with UNASSIGNED_LAYER_STACK and leaves a zero byte file. Since mirroring turns
+# the phone screen off, that was the normal case here. This way also drops
+# screenrecord's three minute ceiling and the copy back from the phone.
+function Test-DisplayAwake {
+    foreach ($line in (Invoke-AdbTarget @('shell', 'dumpsys', 'power'))) {
+        if ($line -match 'mWakefulness=(\w+)') { return ($Matches[1] -eq 'Awake') }
+    }
+    return $true   # unknown: better to try than to refuse
 }
 
-function Stop-Recording {
-    if (-not $script:RecordRemote) { throw 'No recording is running.' }
-    # Already over the line: screenrecord stops by itself after three minutes and
-    # takes the adb client with it. Signalling and waiting again would be pure
-    # delay, and the file on the phone is finished either way.
-    if (-not (Test-RecordingFinished)) {
-        # screenrecord only finalises the MP4 container on SIGINT, so signal the
-        # process on the device instead of killing the adb client here.
-        Invoke-AdbTarget @('shell', 'pkill', '-INT', 'screenrecord') | Out-Null
-        Wait-Pumped 3000
-        if ($script:RecordProc -and -not $script:RecordProc.HasExited) {
-            try { $script:RecordProc.Kill() } catch { }
-        }
+function Get-RecordingPath { return $script:MirrorRecordPath }
+function Test-RecordingActive { return [bool]($script:MirrorRecordPath -and (Test-MirrorActive)) }
+
+# Set while scrcpy was recording, and scrcpy is gone now: the file is closed and
+# nobody has reported it yet. Happens when the mirror window is shut by its own
+# X, or the cable comes out mid recording.
+function Get-FinishedRecording {
+    if ($script:MirrorRecordPath -and -not (Test-MirrorActive)) {
+        $path = $script:MirrorRecordPath
+        $script:MirrorRecordPath = $null
+        $script:RecordStarted    = $null
+        return $path
     }
-    $local = Join-Path (Get-OutputDir) "recording-$($script:RecordStamp).mp4"
-    Invoke-AdbTarget @('pull', $script:RecordRemote, $local) | Out-Null
-    Invoke-AdbTarget @('shell', 'rm', '-f', $script:RecordRemote) | Out-Null
-    $script:RecordRemote = $null
-    $script:RecordProc   = $null
-    if (-not (Test-Path $local)) { throw 'Recording could not be pulled from the device.' }
-    return $local
+    return $null
 }
+
+function New-RecordingPath {
+    return (Join-Path (Get-OutputDir) ("recording-{0}.mp4" -f (Get-Date -Format 'yyyyMMdd-HHmmss')))
+}
+
 
 function Test-ScrcpyUpdate {
     if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
@@ -449,12 +556,16 @@ function Install-ScrcpyUpdate {
 }
 
 function Start-Mirror {
-    param([int]$MaxSize, [int]$Fps, [int]$BitRateMbit, [switch]$StayAwake, [switch]$ScreenOff)
+    param([int]$MaxSize, [int]$Fps, [int]$BitRateMbit, [switch]$StayAwake, [switch]$ScreenOff,
+          [string]$RecordTo)
     $argList = @()
     if ($script:Serial) { $argList += @('-s', $script:Serial) }
     if ($MaxSize -gt 0) { $argList += "--max-size=$MaxSize" }
     if ($Fps -gt 0)     { $argList += "--max-fps=$Fps" }
     if ($BitRateMbit -gt 0) { $argList += "--video-bit-rate=${BitRateMbit}M" }
+    # Writes the stream it is already sending to a file on this PC. No copy back
+    # from the phone, and no three minute ceiling.
+    if ($RecordTo) { $argList += "--record=$RecordTo" }
     if ($StayAwake)     { $argList += '--stay-awake' }
     if ($ScreenOff)     { $argList += @('--turn-screen-off', '--power-off-on-close') }
     # Plain value: ConvertTo-CommandLine quotes it because of the space. Quoting it
@@ -463,6 +574,7 @@ function Start-Mirror {
 
     # CreateNoWindow suppresses scrcpy's console; its own SDL window is unaffected
     # and is what we wait for below. Its stderr is kept so a failure can be named.
+    Write-Log ("mirror start: {0}" -f (ConvertTo-CommandLine $argList))
     $proc = Start-Hidden -FilePath $script:Tools.Scrcpy -Arguments $argList -CaptureError
 
     # Inheriting aside, scrcpy needs a moment before it owns a window. Wait for it
@@ -475,7 +587,9 @@ function Start-Mirror {
         if ($proc.MainWindowHandle -ne [IntPtr]::Zero) {
             [void][PanelNative]::ShowWindow($proc.MainWindowHandle, 9)   # SW_RESTORE
             [void][PanelNative]::SetForegroundWindow($proc.MainWindowHandle)
-            $script:MirrorProc = $proc
+            $script:MirrorProc       = $proc
+            $script:MirrorRecordPath = $RecordTo
+            $script:RecordStarted    = $(if ($RecordTo) { Get-Date } else { $null })
             return $proc
         }
     }
@@ -490,12 +604,14 @@ function Start-Mirror {
                 Where-Object { $_ -match '\S' } | Select-Object -Last 1) -join ''
         }
         if (-not $reason) { $reason = "exit code $($proc.ExitCode)" }
+        Write-Log "mirror failed: exit $($proc.ExitCode) - $($reason.Trim())"
         throw "scrcpy stopped right away - $($reason.Trim())"
     }
 
     # Alive after the full wait but with no window: broken rather than slow. An
     # invisible scrcpy keeps its grip on the device, and pressing the button
     # again would stack up another one, so clear it away instead of leaving it.
+    Write-Log 'mirror failed: no window after 8 s, process killed'
     try { $proc.Kill() } catch { }
     throw 'scrcpy did not open a window within 8 seconds and was stopped.'
 }
@@ -713,6 +829,7 @@ function New-Panel {
     $y     = 14
 
     # ---------------------------------------------------------- device card
+    $chevron    = [string][char]0x25BE
     $cardDevice = New-Card $t $pad $y $inner 78
     $form.Controls.Add($cardDevice)
 
@@ -769,6 +886,25 @@ function New-Panel {
     # Glyph-only button, so the icon font does not affect any label text.
     $btnRefresh = New-FlatButton $t ([char]0xE72C) 366 24 38 30 -FontName 'Segoe MDL2 Assets' -FontSize 10
     $cardDevice.Controls.Add($btnRefresh)
+
+    # Only appears once a second device turns up, and then it takes the place of
+    # the serial text it would otherwise duplicate - a row of its own would leave
+    # the card stretched and half empty for the usual single phone. Items are
+    # rebuilt on every refresh, so this cannot use New-ThemedDropdown, whose list
+    # is fixed when it is created.
+    $menuDevice                 = New-Object System.Windows.Forms.ContextMenuStrip
+    $menuDevice.ShowImageMargin = $false
+    $menuDevice.BackColor       = $t.Field
+    $menuDevice.ForeColor       = $t.Text
+
+    $btnDevice           = New-FlatButton $t '' 200 41 158 24
+    $btnDevice.TextAlign = 'MiddleLeft'
+    $btnDevice.Padding   = New-Object System.Windows.Forms.Padding(6, 0, 0, 0)
+    $btnDevice.Font      = New-Object System.Drawing.Font('Segoe UI', 8.5)
+    $btnDevice.Visible   = $false
+    $btnDevice.Add_Click({ $menuDevice.Show($btnDevice, 0, $btnDevice.Height) }.GetNewClosure())
+    $btnDevice.ContextMenuStrip = $menuDevice
+    $cardDevice.Controls.Add($btnDevice)
 
     $y += 78 + 18
 
@@ -829,7 +965,7 @@ function New-Panel {
     $chkAwake.Text      = 'Keep device awake'
     $chkAwake.Location  = New-Object System.Drawing.Point(16, 88)
     $chkAwake.Size      = New-Object System.Drawing.Size(170, 24)
-    $chkAwake.Checked   = $true
+    $chkAwake.Checked   = [bool]$script:StayAwake
     $chkAwake.ForeColor = $t.Text
     # No FlatStyle Flat here: in dark mode that draws an empty white box with no
     # visible tick. The system renderer shows the state properly.
@@ -867,7 +1003,7 @@ function New-Panel {
     $lblCapture.ForeColor = $t.TextDim
     $lblCapture.Font      = New-Object System.Drawing.Font('Segoe UI', 8)
     $lblCapture.BackColor = [System.Drawing.Color]::Transparent
-    $lblCapture.Text      = 'Saved to Pictures\AndroidMirror. Recording stops by itself after 3 min.'
+    $lblCapture.Text      = 'Saved to Pictures\AndroidMirror. Recording captures the mirrored stream.'
     $cardCapture.Controls.Add($lblCapture)
 
     $y += 86 + 18
@@ -896,14 +1032,24 @@ function New-Panel {
     # ----------------------------------------------------- maintenance card
     $form.Controls.Add((New-SectionLabel $t 'Maintenance' ($pad + 2) $y))
     $y += 18
-    $cardMaint = New-Card $t $pad $y $inner 64
+    $cardMaint = New-Card $t $pad $y $inner 100
     $form.Controls.Add($cardMaint)
 
     $btnUpdate = New-FlatButton $t 'Check for scrcpy update' 16  16 184 32
     $btnApk    = New-FlatButton $t 'Install APK ...'         220 16 184 32
-    $cardMaint.Controls.AddRange(@($btnUpdate, $btnApk))
+    $btnLog    = New-FlatButton $t 'Open log and settings'   16  54 184 32
+    $cardMaint.Controls.AddRange(@($btnUpdate, $btnApk, $btnLog))
 
-    $y += 64 + 14
+    $lblLogHint           = New-Object System.Windows.Forms.Label
+    $lblLogHint.Text      = 'Logs starts, failures and actions'
+    $lblLogHint.Location  = New-Object System.Drawing.Point(212, 60)
+    $lblLogHint.Size      = New-Object System.Drawing.Size(196, 20)
+    $lblLogHint.ForeColor = $t.TextDim
+    $lblLogHint.Font      = New-Object System.Drawing.Font('Segoe UI', 8)
+    $lblLogHint.BackColor = [System.Drawing.Color]::Transparent
+    $cardMaint.Controls.Add($lblLogHint)
+
+    $y += 100 + 14
 
     # ------------------------------------------------------------- statusbar
     $status           = New-Object System.Windows.Forms.Label
@@ -951,7 +1097,7 @@ function New-Panel {
         Buttons          = @{
             Refresh = $btnRefresh; Mirror = $btnMirror; Shot = $btnShot; Rec = $btnRec
             Folder  = $btnFolder;  Wireless = $btnWireless; Usb = $btnUsb
-            Update  = $btnUpdate;  Apk = $btnApk
+            Update  = $btnUpdate;  Apk = $btnApk;  Log = $btnLog
         }
         Combos = @{ Size = $cmbSize; Fps = $cmbFps; Rate = $cmbRate }
         Checks = @{ Awake = $chkAwake; ScreenOff = $chkScreenOff }
@@ -1005,6 +1151,39 @@ function New-Panel {
             }
             $lblSerialRest.Text = "-   $($info.Serial)$extra"
 
+            # Rebuilt only when the set of attached devices actually changes,
+            # otherwise the menu would be torn down under an open dropdown.
+            if ($info.Count -gt 1) {
+                $key = ($info.Serials -join ',')
+                if ($btnDevice.Tag -ne $key) {
+                    $menuDevice.Items.Clear()
+                    foreach ($serial in $info.Serials) {
+                        $item           = New-Object System.Windows.Forms.ToolStripMenuItem($serial)
+                        $item.BackColor = $ui.Theme.Field
+                        $item.ForeColor = $ui.Theme.Text
+                        # Reads the serial off the item that was clicked, so the
+                        # loop variable does not have to survive into the handler.
+                        $item.Add_Click({
+                            param($sender, $e)
+                            Set-CurrentSerial $sender.Text
+                            Reset-BatteryCache
+                            Write-Log "device switched to $($sender.Text)"
+                            & $ui.Refresh -Force
+                        }.GetNewClosure())
+                        [void]$menuDevice.Items.Add($item)
+                    }
+                    $btnDevice.Tag = $key
+                }
+                # Sits where the serial text would be, and replaces it.
+                $lblSerialRest.Text = ''
+                $btnDevice.Left     = $lblSerialRest.Left
+                $btnDevice.Text     = "$($info.Serial)   $chevron"
+                $btnDevice.Visible  = $true
+            } else {
+                $btnDevice.Visible = $false
+                $btnDevice.Tag     = $null
+            }
+
             # PreferredWidth rather than Width: it is the size the label will
             # take for the text just assigned, without waiting for a layout pass.
             $lblTemp.Left = $lblSerial.Left + $lblSerial.PreferredWidth + 10
@@ -1026,6 +1205,7 @@ function New-Panel {
             $lblSerial.Text      = 'Enable USB debugging and confirm the prompt on the phone.'
             $lblTemp.Text        = ''
             $lblSerialRest.Text  = ''
+            $btnDevice.Visible   = $false
             foreach ($b in $deviceButtons) { $b.Enabled = $false }
         }
         $dot.Invalidate()
@@ -1036,6 +1216,10 @@ function New-Panel {
         # A running recording must stay stoppable even if the device blips.
         if (Test-RecordingActive) { $btnRec.Enabled = $true }
     }.GetNewClosure()
+
+    # Handed around in the shared bag because handlers created earlier - the
+    # device menu items above - cannot capture a closure defined after them.
+    $ui.Refresh = $refresh
 
     $runGuarded = {
         param([scriptblock]$Work, [string]$Running)
@@ -1053,12 +1237,60 @@ function New-Panel {
         }
     }.GetNewClosure()
 
+    # Written when mirroring starts and again on close, so the choice survives
+    # both a normal exit and a machine that goes down under the panel.
+    $saveSettings = {
+        $size = 0
+        if ($ui.Combos.Size.Tag -ne 'Original') { $size = [int]$ui.Combos.Size.Tag }
+        Write-Settings ([pscustomobject]@{
+            MaxSize   = $size
+            Fps       = [int]$ui.Combos.Fps.Tag
+            BitRate   = [int](($ui.Combos.Rate.Tag -split ' ')[0])
+            StayAwake = [bool]$ui.Checks.Awake.Checked
+            ScreenOff = [bool]$ui.Checks.ScreenOff.Checked
+        })
+    }.GetNewClosure()
+
     # The button follows the actual state of scrcpy, so it also flips back on its
     # own when the mirror window is closed by its own X or the cable comes out.
     $syncMirror = {
         if ($form.IsDisposed) { return }
-        if (Test-MirrorActive) { $btnMirror.Text = 'Stop mirroring' }
-        else                   { $btnMirror.Text = 'Start mirroring' }
+        if (Test-MirrorActive)    { $btnMirror.Text = 'Stop mirroring' }
+        else                      { $btnMirror.Text = 'Start mirroring' }
+        if (Test-RecordingActive) { $btnRec.Text = 'Stop recording' }
+        else                      { $btnRec.Text = 'Start recording' }
+    }.GetNewClosure()
+
+    # The single place that reads the controls and starts scrcpy. Pass a path to
+    # record, nothing to mirror only.
+    $startMirror = {
+        param([string]$RecordTo)
+        $size = 0
+        if ($cmbSize.Tag -ne 'Original') { $size = [int]$cmbSize.Tag }
+        $rate = [int](($cmbRate.Tag -split ' ')[0])
+        Start-Mirror -MaxSize $size -Fps ([int]$cmbFps.Tag) -BitRateMbit $rate `
+            -StayAwake:$chkAwake.Checked -ScreenOff:$chkScreenOff.Checked `
+            -RecordTo $RecordTo | Out-Null
+    }.GetNewClosure()
+
+    # Checks what actually landed on disk instead of assuming it worked.
+    $reportRecording = {
+        param([string]$Path)
+        if (-not $Path) { return }
+        if (-not (Test-Path $Path)) {
+            Write-Log "recording file was never written: $Path"
+            & $setStatus 'The recording file was not written.' $ui.Theme.Bad
+            return
+        }
+        $item = Get-Item $Path
+        if ($item.Length -eq 0) {
+            Remove-Item -Path $Path -Force -ErrorAction SilentlyContinue
+            Write-Log 'recording came back empty, discarded'
+            & $setStatus 'The recording came back empty and was discarded.' $ui.Theme.Bad
+            return
+        }
+        Write-Log ("recording saved: {0} ({1:N0} bytes)" -f $item.Name, $item.Length)
+        & $setStatus ("Saved {0}  ({1:N1} MB)" -f $item.Name, ($item.Length / 1MB)) $null
     }.GetNewClosure()
 
     $btnRefresh.Add_Click({
@@ -1074,21 +1306,20 @@ function New-Panel {
     $btnMirror.Add_Click({
         if (Test-MirrorActive) {
             & $runGuarded {
-                Stop-Mirror
+                # Comes back with the recording path when this mirror was
+                # recording, so stopping the mirror still reports the file.
+                $file = Stop-Mirror
                 & $syncMirror
-                & $setStatus 'Mirroring stopped.' $null
+                if ($file) { & $reportRecording $file }
+                else       { & $setStatus 'Mirroring stopped.' $null }
             } 'Closing the mirror window ...'
             return
         }
         & $runGuarded {
-            $size = 0
-            if ($cmbSize.Tag -ne 'Original') { $size = [int]$cmbSize.Tag }
-            # Tag reads like "24 Mbit"; scrcpy wants just the number.
-            $rate = [int](($cmbRate.Tag -split ' ')[0])
             # Start-Mirror either comes back with a window on screen or raises.
-            Start-Mirror -MaxSize $size -Fps ([int]$cmbFps.Tag) -BitRateMbit $rate `
-                -StayAwake:$chkAwake.Checked -ScreenOff:$chkScreenOff.Checked | Out-Null
+            & $startMirror $null
             & $syncMirror
+            & $saveSettings
             & $setStatus 'scrcpy started.' $null
         } 'Starting scrcpy ...'
     }.GetNewClosure())
@@ -1100,24 +1331,34 @@ function New-Panel {
         } 'Taking screenshot ...'
     }.GetNewClosure())
 
+    # Recording is the mirror written to a file, so both switches operate on the
+    # same scrcpy. Turning recording on or off therefore restarts it, which costs
+    # a second of black window - the price for a recording that also works while
+    # the phone's own screen is off.
     $btnRec.Add_Click({
         if (Test-RecordingActive) {
             & $runGuarded {
-                $file = Stop-Recording
-                $btnRec.Text = 'Start recording'
-                & $setStatus "Saved $(Split-Path -Leaf $file)" $null
-            } 'Stopping and pulling ...'
+                $file = Stop-Mirror
+                & $startMirror $null          # straight back to plain mirroring
+                & $syncMirror
+                & $reportRecording $file
+            } 'Finishing the recording ...'
         } else {
             & $runGuarded {
-                Start-Recording | Out-Null
-                $btnRec.Text = 'Stop recording'
+                if (Test-MirrorActive) { [void](Stop-Mirror) }
+                & $startMirror (New-RecordingPath)
+                & $syncMirror
                 & $setStatus 'Recording ...' $ui.Theme.Bad
-            } 'Starting recording ...'
+            } 'Starting the recording ...'
         }
     }.GetNewClosure())
 
     $btnFolder.Add_Click({
         Start-Process (Get-OutputDir) | Out-Null
+    }.GetNewClosure())
+
+    $btnLog.Add_Click({
+        Start-Process (Get-ConfigDir) | Out-Null
     }.GetNewClosure())
 
     $btnWireless.Add_Click({
@@ -1179,14 +1420,20 @@ function New-Panel {
     # screenrecord stops by itself after three minutes and the adb client exits
     # with it. Without noticing that, the button would keep offering "Stop
     # recording" for a file that is long finished and still on the phone.
+    # scrcpy went away while it was recording - closed by its own X, or the cable
+    # came out. The file is complete at that point, it has just not been reported.
     $checkRecording = {
         if ($ui.Busy -or $form.IsDisposed) { return }
-        if (-not (Test-RecordingActive) -or -not (Test-RecordingFinished)) { return }
-        & $runGuarded {
-            $file = Stop-Recording
-            $btnRec.Text = 'Start recording'
-            & $setStatus "Recording hit the 3 min limit, saved $(Split-Path -Leaf $file)" $null
-        } 'Recording finished, pulling ...'
+        $finished = Get-FinishedRecording
+        if ($finished) {
+            & $syncMirror
+            & $reportRecording $finished
+            return
+        }
+        if (Test-RecordingActive) {
+            $elapsed = Get-RecordingElapsed
+            if ($elapsed) { & $setStatus ('Recording ... {0:mm\:ss}' -f $elapsed) $ui.Theme.Bad }
+        }
     }.GetNewClosure()
 
     # -StartMirror fires once, and only when a device is genuinely ready, so
@@ -1248,12 +1495,19 @@ function New-Panel {
     $form.Add_FormClosing({
         $boot.Stop()
         $timer.Stop()
-        # No loop left worth pumping once the window is going away.
-        Disable-UiPump
-        if (Test-RecordingActive) {
-            # Do not leave a half-written file sitting on the phone.
-            try { Stop-Recording | Out-Null } catch { }
+        & $saveSettings
+        # The mirror goes with the panel that opened it, and closing it properly
+        # is also what finishes a recording into a playable file. Still pumping
+        # at this point, so scrcpy's own shutdown runs without freezing the close.
+        if (Test-MirrorActive) {
+            try {
+                $file = Stop-Mirror
+                if ($file) { Write-Log "recording finished while closing: $file" }
+            } catch { Write-Log "mirror not closed cleanly: $($_.Exception.Message)" }
         }
+        # No loop left worth pumping once the window is really going away.
+        Disable-UiPump
+        Write-Log 'panel closed'
     }.GetNewClosure())
 
     # Exposed so -SelfTest can inspect the shared state without showing the window.
@@ -1262,6 +1516,21 @@ function New-Panel {
 }
 
 # -------------------------------------------------------------------- main
+
+# Last used selection, unless this run was told otherwise on the command line -
+# an explicit -ScreenOff from the desktop shortcut has to win over the file.
+$saved = Read-Settings
+if ($saved) {
+    if (-not $PSBoundParameters.ContainsKey('MaxSize') -and
+        (@(0, 800, 1024, 1280, 1920) -contains [int]$saved.MaxSize)) { $MaxSize = [int]$saved.MaxSize }
+    if (-not $PSBoundParameters.ContainsKey('Fps') -and
+        (@(24, 30, 60) -contains [int]$saved.Fps)) { $Fps = [int]$saved.Fps }
+    if (-not $PSBoundParameters.ContainsKey('BitRate') -and
+        (@(8, 16, 24, 32) -contains [int]$saved.BitRate)) { $BitRate = [int]$saved.BitRate }
+    if (-not $PSBoundParameters.ContainsKey('ScreenOff') -and
+        $null -ne $saved.ScreenOff) { $ScreenOff = [bool]$saved.ScreenOff }
+    if ($null -ne $saved.StayAwake) { $script:StayAwake = [bool]$saved.StayAwake }
+}
 
 $script:Tools = Resolve-Tools
 if (-not $script:Tools) {
@@ -1280,6 +1549,8 @@ if ($SelfTest) {
     $info = Get-DeviceInfo
     Write-Host ("info       : ready=$($info.Ready) model='$($info.Model)' android=$($info.Android) battery=$($info.Battery) temp=$($info.Temperature) count=$($info.Count)")
     Write-Host ("output dir : {0}" -f (Get-OutputDir))
+    Write-Host ("settings   : {0} (exists={1})" -f (Get-SettingsPath), (Test-Path (Get-SettingsPath)))
+    Write-Host ("log        : {0} (exists={1})" -f (Get-LogPath), (Test-Path (Get-LogPath)))
     $upd = Test-ScrcpyUpdate
     Write-Host ("update     : available=$($upd.Available) reason='$($upd.Reason)'")
     if ($info.Ready) { Write-Host ("wlan ip    : {0}" -f (Get-DeviceIp)) }
@@ -1322,5 +1593,10 @@ if ($SelfTest) {
 }
 
 Hide-OwnConsole
-if (-not (Request-SingleInstance)) { exit 0 }
+if (-not (Request-SingleInstance)) {
+    Write-Log 'second start, brought the running panel to the front'
+    exit 0
+}
+Write-Log ("panel started: size=$MaxSize fps=$Fps bitrate=${BitRate}M screenoff=$([bool]$ScreenOff) " +
+           "stayawake=$($script:StayAwake) automirror=$([bool]$StartMirror)")
 [void][System.Windows.Forms.Application]::Run((New-Panel))
