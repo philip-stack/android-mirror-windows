@@ -15,7 +15,7 @@ No app on the phone, no root, no account, no ads.
 | File | Purpose |
 | --- | --- |
 | `setup.ps1` | Installs scrcpy via winget, starts the adb server, creates desktop shortcuts |
-| `panel.bat` / `panel.ps1` | Control panel window: mirror, screenshot, record, wireless, update |
+| `panel.vbs` / `panel.ps1` | Control panel window: mirror, screenshot, record, wireless, update |
 | `mirror.bat` | Checks for a scrcpy update, waits for a device, then mirrors it |
 | `mirror-dark.bat` | Same, but keeps the phone screen off while you use it from the PC |
 | `connect-wireless.bat` | Switches the device to wireless debugging so the cable can go |
@@ -25,7 +25,7 @@ Both launchers pass any extra arguments straight through to scrcpy, so
 
 ## Control panel
 
-Double-click `panel.bat` for a small window instead of the one-shot launchers:
+Double-click `panel.vbs` for a small window instead of the one-shot launchers:
 
 - live device status (model, Android version, battery), polled every 4 seconds
 - start mirroring with a max size / FPS / screen-off picker
@@ -37,6 +37,19 @@ Double-click `panel.bat` for a small window instead of the one-shot launchers:
 It is plain WinForms from PowerShell, so there is nothing extra to install.
 `panel.ps1 -SelfTest` runs the logic and builds the window without showing it,
 which is how the non-visual parts stay testable.
+
+Start it with `-StartMirror` to begin mirroring right away, plus `-ScreenOff`,
+`-MaxSize` and `-Fps` to preselect the options. With `-StartMirror` and no device
+attached the panel waits and starts on its own once one appears:
+
+```powershell
+.\panel.vbs -StartMirror -ScreenOff
+```
+
+The entry point is a VBScript shim rather than the `.ps1` directly, because that
+is the only way to end up with no console window: `powershell -WindowStyle
+Hidden` still leaves an empty Windows Terminal tab behind on Windows 11.
+`panel.bat` does the same thing and exists for shortcuts that expect a `.bat`.
 
 ## Requirements
 

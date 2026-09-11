@@ -7,6 +7,19 @@
     Wraps scrcpy and adb in a WinForms window: mirroring, screenshots, screen
     recording, wireless debugging, APK install and a manual scrcpy update check.
 
+.PARAMETER StartMirror
+    Begin mirroring as soon as the panel opens. If no device is attached yet it
+    waits and starts on its own once one shows up.
+
+.PARAMETER ScreenOff
+    Preselect "Phone screen off", and use it for -StartMirror.
+
+.PARAMETER MaxSize
+    Preselect a max size. 0 means the device's own resolution.
+
+.PARAMETER Fps
+    Preselect a frame rate cap.
+
 .PARAMETER SelfTest
     Run the logic and build the window without showing it, printing the results.
     A GUI cannot be clicked headlessly, so this is what keeps the non-visual
@@ -14,9 +27,18 @@
 
 .EXAMPLE
     .\panel.ps1
+
+.EXAMPLE
+    .\panel.ps1 -StartMirror -ScreenOff
 #>
 [CmdletBinding()]
 param(
+    [switch]$StartMirror,
+    [switch]$ScreenOff,
+    [ValidateSet(0, 800, 1024, 1280, 1920)]
+    [int]$MaxSize = 0,
+    [ValidateSet(24, 30, 60)]
+    [int]$Fps = 60,
     [switch]$SelfTest
 )
 
@@ -25,6 +47,38 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
+
+# Used to pull the scrcpy window forward (see Start-Mirror) and to hide our own
+# console window (see Hide-OwnConsole).
+if (-not ([System.Management.Automation.PSTypeName]'PanelNative').Type) {
+    Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public class PanelNative {
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
+    [DllImport("kernel32.dll")] public static extern uint GetConsoleProcessList(uint[] buffer, uint count);
+}
+'@
+}
+
+function Hide-OwnConsole {
+    # powershell.exe -WindowStyle Hidden still leaves an empty console window
+    # behind, because the console is allocated before the style is applied. Hide
+    # it here instead.
+    #
+    # Only when we are the sole process attached to it: run from an existing
+    # terminal the shell is attached too, and hiding that would take the user's
+    # own window away.
+    $console = [PanelNative]::GetConsoleWindow()
+    if ($console -eq [IntPtr]::Zero) { return }
+    $buffer = New-Object uint32[] 8
+    $count  = [PanelNative]::GetConsoleProcessList($buffer, 8)
+    if ($count -eq 1) {
+        [void][PanelNative]::ShowWindow($console, 0)   # SW_HIDE
+    }
+}
 
 $script:Tools        = $null
 $script:Serial       = $null
@@ -53,25 +107,63 @@ function Resolve-Tools {
     return [pscustomobject]@{ Scrcpy = $exe.FullName; Adb = $adb }
 }
 
+# .NET Framework has no ProcessStartInfo.ArgumentList, so the command line is
+# built by hand. Only whitespace and quotes need escaping for our purposes.
+function ConvertTo-CommandLine {
+    param([string[]]$Arguments)
+    $parts = foreach ($a in $Arguments) {
+        if ($a -match '[\s"]') { '"' + ($a -replace '"', '\"') + '"' } else { $a }
+    }
+    return ($parts -join ' ')
+}
+
+# Runs a console program without letting a console window flash up. Calling adb
+# with the call operator pops a window for every invocation, and the device poll
+# runs several of those every few seconds - which is exactly the flickering.
+#
+# CreateNoWindow also sidesteps Windows PowerShell 5.1 turning native stderr into
+# a terminating NativeCommandError, because nothing goes through the pipeline.
+function Invoke-Hidden {
+    param([string]$FilePath, [string[]]$Arguments, [int]$TimeoutMs = 30000)
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName               = $FilePath
+    $psi.Arguments              = ConvertTo-CommandLine $Arguments
+    $psi.UseShellExecute        = $false
+    $psi.CreateNoWindow         = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError  = $true
+
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    # Read before waiting: a full pipe buffer would otherwise deadlock us.
+    $stdout = $proc.StandardOutput.ReadToEnd()
+    [void]$proc.StandardError.ReadToEnd()
+    if (-not $proc.WaitForExit($TimeoutMs)) {
+        try { $proc.Kill() } catch { }
+    }
+    if ([string]::IsNullOrEmpty($stdout)) { return @() }
+    return @($stdout -split "`r?`n" | Where-Object { $_ -ne '' })
+}
+
 # One explicit array parameter, deliberately NOT ValueFromRemainingArguments:
 # with loose arguments PowerShell would try to bind adb's own flags, and "-o" in
 # "ip -f inet -o addr" resolves ambiguously against -OutVariable/-OutBuffer.
-#
-# Windows PowerShell 5.1 also turns native stderr into a terminating
-# NativeCommandError while ErrorActionPreference is Stop, so relax it here and
-# drop the stderr records.
 function Invoke-Adb {
     param([string[]]$Arguments)
     if (-not $script:Tools -or -not $script:Tools.Adb) { return @() }
-    $previous = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    try {
-        & $script:Tools.Adb @Arguments 2>&1 |
-            Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] } |
-            ForEach-Object { [string]$_ }
-    } finally {
-        $ErrorActionPreference = $previous
-    }
+    return Invoke-Hidden -FilePath $script:Tools.Adb -Arguments $Arguments
+}
+
+# Like Invoke-Hidden but for something we keep running, so no redirection: an
+# undrained pipe would eventually block the child.
+function Start-Hidden {
+    param([string]$FilePath, [string[]]$Arguments)
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName        = $FilePath
+    $psi.Arguments       = ConvertTo-CommandLine $Arguments
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow  = $true
+    return [System.Diagnostics.Process]::Start($psi)
 }
 
 function Invoke-AdbTarget {
@@ -123,6 +215,14 @@ function Get-DeviceInfo {
     }
 }
 
+# Closures created with GetNewClosure() live in their own module, where $script:
+# resolves to that module rather than to this file. Script-scope state is therefore
+# read through functions, which do resolve correctly from inside a closure.
+function Get-CurrentSerial { return $script:Serial }
+function Reset-CurrentSerial { $script:Serial = $null }
+function Test-RecordingActive { return [bool]$script:RecordRemote }
+function Get-ScrcpyPath { return $script:Tools.Scrcpy }
+
 function Get-DeviceIp {
     foreach ($line in (Invoke-AdbTarget @('shell', 'ip', '-f', 'inet', '-o', 'addr', 'show', 'wlan0'))) {
         # 47: wlan0    inet 10.0.0.5/16 brd ...  -> field 4 holds the address
@@ -159,8 +259,7 @@ function Start-Recording {
     $argList = @()
     if ($script:Serial) { $argList += @('-s', $script:Serial) }
     $argList += @('shell', 'screenrecord', '--bit-rate', '8000000', $script:RecordRemote)
-    $script:RecordProc = Start-Process -FilePath $script:Tools.Adb -ArgumentList $argList `
-        -WindowStyle Hidden -PassThru
+    $script:RecordProc = Start-Hidden -FilePath $script:Tools.Adb -Arguments $argList
     return $script:RecordRemote
 }
 
@@ -188,15 +287,9 @@ function Test-ScrcpyUpdate {
     }
     # "winget upgrade <package>" would install straight away, so ask "list".
     # Keying on the package id keeps this independent of the display language.
-    $previous = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    try {
-        $out = & winget list --id Genymobile.scrcpy -e --upgrade-available --disable-interactivity 2>&1 |
-            Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] } |
-            ForEach-Object { [string]$_ }
-    } finally {
-        $ErrorActionPreference = $previous
-    }
+    $winget = (Get-Command winget).Source
+    $out = Invoke-Hidden -FilePath $winget -Arguments @(
+        'list', '--id', 'Genymobile.scrcpy', '-e', '--upgrade-available', '--disable-interactivity')
     $row = $out | Where-Object { $_ -match 'Genymobile\.scrcpy' } | Select-Object -First 1
     if (-not $row) { return [pscustomobject]@{ Available = $false; Reason = 'up to date' } }
 
@@ -208,14 +301,10 @@ function Test-ScrcpyUpdate {
 }
 
 function Install-ScrcpyUpdate {
-    $previous = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    try {
-        & winget upgrade --id Genymobile.scrcpy -e --accept-package-agreements `
-            --accept-source-agreements --disable-interactivity 2>&1 | Out-Null
-    } finally {
-        $ErrorActionPreference = $previous
-    }
+    $winget = (Get-Command winget).Source
+    [void](Invoke-Hidden -FilePath $winget -TimeoutMs 300000 -Arguments @(
+        'upgrade', '--id', 'Genymobile.scrcpy', '-e',
+        '--accept-package-agreements', '--accept-source-agreements', '--disable-interactivity'))
     $script:Tools = Resolve-Tools
 }
 
@@ -227,8 +316,27 @@ function Start-Mirror {
     if ($Fps -gt 0)     { $argList += "--max-fps=$Fps" }
     if ($StayAwake)     { $argList += '--stay-awake' }
     if ($ScreenOff)     { $argList += @('--turn-screen-off', '--power-off-on-close') }
+    # Plain value: ConvertTo-CommandLine quotes it because of the space. Quoting it
+    # here as well would put the quotes into the title scrcpy displays.
     $argList += '--window-title=Android Mirror'
-    return Start-Process -FilePath $script:Tools.Scrcpy -ArgumentList $argList -PassThru
+
+    # CreateNoWindow suppresses scrcpy's console; its own SDL window is unaffected
+    # and is what we wait for below.
+    $proc = Start-Hidden -FilePath $script:Tools.Scrcpy -Arguments $argList
+
+    # Inheriting aside, scrcpy needs a moment before it owns a window. Wait for it
+    # and pull it to the front, rather than trusting the show state alone.
+    for ($i = 0; $i -lt 25; $i++) {
+        Start-Sleep -Milliseconds 200
+        if ($proc.HasExited) { break }
+        $proc.Refresh()
+        if ($proc.MainWindowHandle -ne [IntPtr]::Zero) {
+            [void][PanelNative]::ShowWindow($proc.MainWindowHandle, 9)   # SW_RESTORE
+            [void][PanelNative]::SetForegroundWindow($proc.MainWindowHandle)
+            break
+        }
+    }
+    return $proc
 }
 
 # --------------------------------------------------------------------- UI
@@ -252,13 +360,24 @@ function New-Panel {
     $status.BorderStyle  = 'Fixed3D'
     $form.Controls.Add($status)
 
+    # One shared bag for everything the handlers touch. Closures capture variables
+    # by value, so a hashtable reference is what makes mutations visible to all of
+    # them; plain $script: variables would land in each closure's own module.
+    $ui = @{
+        Status           = $status
+        Busy             = $false
+        AutoStartPending = [bool]$StartMirror
+    }
+
+    # Must be a closure itself: a plain scriptblock resolves its variables in
+    # whatever scope invokes it, and would not find $status from a handler.
     $setStatus = {
         param([string]$Text, $Color)
         if ($null -eq $Color) { $Color = [System.Drawing.SystemColors]::ControlText }
-        $status.Text      = "  $Text"
-        $status.ForeColor = $Color
-        $status.Refresh()
-    }
+        $ui.Status.Text      = "  $Text"
+        $ui.Status.ForeColor = $Color
+        $ui.Status.Refresh()
+    }.GetNewClosure()
 
     # -- device ----------------------------------------------------------
     $grpDevice          = New-Object System.Windows.Forms.GroupBox
@@ -304,6 +423,10 @@ function New-Panel {
     $cmbSize.Size          = New-Object System.Drawing.Size(110, 24)
     [void]$cmbSize.Items.AddRange(@('Original', '1920', '1280', '1024', '800'))
     $cmbSize.SelectedIndex = 0
+    if ($MaxSize -gt 0) {
+        $index = $cmbSize.Items.IndexOf([string]$MaxSize)
+        if ($index -ge 0) { $cmbSize.SelectedIndex = $index }
+    }
     $grpMirror.Controls.Add($cmbSize)
 
     $lblFps          = New-Object System.Windows.Forms.Label
@@ -318,6 +441,8 @@ function New-Panel {
     $cmbFps.Size          = New-Object System.Drawing.Size(80, 24)
     [void]$cmbFps.Items.AddRange(@('60', '30', '24'))
     $cmbFps.SelectedIndex = 0
+    $fpsIndex = $cmbFps.Items.IndexOf([string]$Fps)
+    if ($fpsIndex -ge 0) { $cmbFps.SelectedIndex = $fpsIndex }
     $grpMirror.Controls.Add($cmbFps)
 
     $chkAwake          = New-Object System.Windows.Forms.CheckBox
@@ -331,6 +456,7 @@ function New-Panel {
     $chkScreenOff.Text     = 'Phone screen off'
     $chkScreenOff.Location = New-Object System.Drawing.Point(206, 56)
     $chkScreenOff.Size     = New-Object System.Drawing.Size(170, 22)
+    $chkScreenOff.Checked  = [bool]$ScreenOff
     $grpMirror.Controls.Add($chkScreenOff)
 
     $btnMirror          = New-Object System.Windows.Forms.Button
@@ -427,7 +553,7 @@ function New-Panel {
     $deviceButtons = @($btnMirror, $btnShot, $btnRec, $btnWireless, $btnUsb, $btnApk)
 
     $refresh = {
-        if ($script:Busy) { return }
+        if ($ui.Busy) { return }
         $info = Get-DeviceInfo
         if ($info.Ready) {
             $battery = ''
@@ -448,13 +574,13 @@ function New-Panel {
             foreach ($b in $deviceButtons) { $b.Enabled = $false }
         }
         # A running recording must stay stoppable even if the device blips.
-        if ($script:RecordRemote) { $btnRec.Enabled = $true }
+        if (Test-RecordingActive) { $btnRec.Enabled = $true }
     }.GetNewClosure()
 
     $runGuarded = {
         param([scriptblock]$Work, [string]$Running)
-        if ($script:Busy) { return }
-        $script:Busy = $true
+        if ($ui.Busy) { return }
+        $ui.Busy = $true
         $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
         & $setStatus $Running $null
         try {
@@ -463,7 +589,7 @@ function New-Panel {
             & $setStatus "Failed: $($_.Exception.Message)" ([System.Drawing.Color]::FromArgb(170, 30, 30))
         } finally {
             $form.Cursor = [System.Windows.Forms.Cursors]::Default
-            $script:Busy = $false
+            $ui.Busy = $false
         }
     }.GetNewClosure()
 
@@ -489,7 +615,7 @@ function New-Panel {
     }.GetNewClosure())
 
     $btnRec.Add_Click({
-        if ($script:RecordRemote) {
+        if (Test-RecordingActive) {
             & $runGuarded {
                 $file = Stop-Recording
                 $btnRec.Text = 'Start recording'
@@ -528,7 +654,7 @@ function New-Panel {
         & $runGuarded {
             Invoke-Adb @('disconnect') | Out-Null
             Invoke-AdbTarget @('usb') | Out-Null
-            $script:Serial = $null
+            Reset-CurrentSerial
             & $refresh
             & $setStatus 'Back to USB only.' $null
         } 'Returning to USB ...'
@@ -548,7 +674,7 @@ function New-Panel {
             if ($answer -ne 'Yes') { & $setStatus 'Update skipped.' $null; return }
             & $setStatus 'Installing update ...' $null
             Install-ScrcpyUpdate
-            $lblVersion.Text = "  scrcpy: $($script:Tools.Scrcpy)"
+            $lblVersion.Text = "  scrcpy: $(Get-ScrcpyPath)"
             & $setStatus 'Update installed.' $null
         } 'Checking for updates ...'
     }.GetNewClosure())
@@ -564,26 +690,42 @@ function New-Panel {
         } 'Installing APK ...'
     }.GetNewClosure())
 
+    # -StartMirror fires once, and only when a device is genuinely ready, so
+    # plugging the cable in after opening the panel still works.
+    $tryAutoStart = {
+        if (-not $ui.AutoStartPending) { return }
+        if ($ui.Busy -or -not (Get-CurrentSerial) -or -not $btnMirror.Enabled) { return }
+        $ui.AutoStartPending = $false
+        $btnMirror.PerformClick()
+    }.GetNewClosure()
+
     # Poll so the panel notices a cable being plugged in or pulled.
     $timer          = New-Object System.Windows.Forms.Timer
     $timer.Interval = 4000
-    $timer.Add_Tick({ & $refresh }.GetNewClosure())
+    $timer.Add_Tick({ & $refresh; & $tryAutoStart }.GetNewClosure())
 
     $form.Add_Shown({
-        $lblVersion.Text = "  scrcpy: $($script:Tools.Scrcpy)"
+        $lblVersion.Text = "  scrcpy: $(Get-ScrcpyPath)"
         & $refresh
-        & $setStatus 'Ready.' $null
+        if ($ui.AutoStartPending -and -not (Get-CurrentSerial)) {
+            & $setStatus 'Waiting for a device, then mirroring starts by itself ...' $null
+        } else {
+            & $setStatus 'Ready.' $null
+        }
         $timer.Start()
+        & $tryAutoStart
     }.GetNewClosure())
 
     $form.Add_FormClosing({
         $timer.Stop()
-        if ($script:RecordRemote) {
+        if (Test-RecordingActive) {
             # Do not leave a half-written file sitting on the phone.
             try { Stop-Recording | Out-Null } catch { }
         }
     }.GetNewClosure())
 
+    # Exposed so -SelfTest can inspect the shared state without showing the window.
+    $form.Tag = $ui
     return $form
 }
 
@@ -620,9 +762,19 @@ if ($SelfTest) {
         $buttons += @($g.Controls | Where-Object { $_ -is [System.Windows.Forms.Button] } | ForEach-Object { $_.Text })
     }
     Write-Host ("buttons    : {0}" -f ($buttons -join ', '))
+
+    # Prove the -MaxSize/-Fps/-ScreenOff parameters actually reached the controls.
+    $mirror  = $groups | Where-Object { $_.Text.Trim() -eq 'Mirror' }
+    $combos  = @($mirror.Controls | Where-Object { $_ -is [System.Windows.Forms.ComboBox] })
+    $checks  = @($mirror.Controls | Where-Object { $_ -is [System.Windows.Forms.CheckBox] })
+    $picked  = ($combos | ForEach-Object { $_.SelectedItem }) -join ' / '
+    $ticked  = ($checks | ForEach-Object { "$($_.Text)=$($_.Checked)" }) -join ', '
+    Write-Host ("mirror set : $picked   [$ticked]")
+    Write-Host ("auto start : {0}" -f $form.Tag.AutoStartPending)
     $form.Dispose()
     Write-Host "OK`n" -ForegroundColor Green
     return
 }
 
+Hide-OwnConsole
 [void][System.Windows.Forms.Application]::Run((New-Panel))

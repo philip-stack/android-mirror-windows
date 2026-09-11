@@ -1,5 +1,9 @@
 @echo off
 rem Opens the control panel window.
-rem "start" lets this console close immediately, and -WindowStyle Hidden keeps
-rem PowerShell itself from flashing up a second one.
-start "" powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "%~dp0panel.ps1"
+rem
+rem Goes through panel.vbs because that is the only way to get no console window
+rem at all: "powershell -WindowStyle Hidden" still leaves an empty Windows
+rem Terminal tab behind on Windows 11.
+rem
+rem Arguments are passed on, so "panel.bat -StartMirror -ScreenOff" works.
+start "" wscript "%~dp0panel.vbs" %*
