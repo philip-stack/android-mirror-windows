@@ -20,6 +20,14 @@
 .PARAMETER Fps
     Preselect a frame rate cap.
 
+.PARAMETER BitRate
+    Preselect the video bit rate in Mbit/s. 8 is scrcpy's own default and stays
+    the default here: it is thin for a 1280x2856 screen - 0.036 bits per pixel
+    at 60 fps, which smears while things move - but raising it makes the phone's
+    encoder work harder, and in a game that showed up as stalling rather than a
+    sharper picture. Raise it for reading and scrolling, leave it for games, or
+    cut the pixel count with -MaxSize instead, which helps both at once.
+
 .PARAMETER SelfTest
     Run the logic and build the window without showing it, printing the results.
     A GUI cannot be clicked headlessly, so this is what keeps the non-visual
@@ -39,6 +47,8 @@ param(
     [int]$MaxSize = 0,
     [ValidateSet(24, 30, 60)]
     [int]$Fps = 60,
+    [ValidateSet(8, 16, 24, 32)]
+    [int]$BitRate = 8,
     [switch]$SelfTest
 )
 
@@ -59,6 +69,7 @@ public class PanelNative {
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
     [DllImport("kernel32.dll")] public static extern uint GetConsoleProcessList(uint[] buffer, uint count);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
     [DllImport("dwmapi.dll")] public static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
 }
 '@
@@ -81,12 +92,42 @@ function Hide-OwnConsole {
     }
 }
 
+# Held for the lifetime of the process, which is what keeps the name taken.
+$script:Instance = $null
+
+function Request-SingleInstance {
+    # A second panel polls the same phone in parallel and the two end up fighting
+    # over adb - we had two of them running at once. Hand the user the window
+    # that is already open instead of stacking another one behind it.
+    $created = $false
+    $script:Instance = New-Object System.Threading.Mutex($true, 'Local\AndroidControlPanel', [ref]$created)
+    if ($created) { return $true }
+
+    $existing = [PanelNative]::FindWindow($null, 'Android Control Panel')
+    if ($existing -ne [IntPtr]::Zero) {
+        [void][PanelNative]::ShowWindow($existing, 9)   # SW_RESTORE
+        [void][PanelNative]::SetForegroundWindow($existing)
+    }
+    return $false
+}
+
 $script:Tools        = $null
 $script:Serial       = $null
 $script:RecordRemote = $null
 $script:RecordProc   = $null
 $script:RecordStamp  = $null
+$script:MirrorProc   = $null
 $script:Busy         = $false
+
+# Per serial: model and Android version, which never change once known.
+$script:DeviceFacts      = @{}
+$script:BatterySerial    = $null
+$script:BatteryLevel     = $null
+$script:BatteryTemp      = $null
+$script:BatteryStamp     = [DateTime]::MinValue
+# Ten seconds: the charge level does not need it, but the temperature is worth
+# watching while mirroring, and both arrive in the same single adb call.
+$script:BatteryMaxAgeSec = 10
 
 # ----------------------------------------------------------------- tooling
 
@@ -124,6 +165,27 @@ function ConvertTo-CommandLine {
 #
 # CreateNoWindow also sidesteps Windows PowerShell 5.1 turning native stderr into
 # a terminating NativeCommandError, because nothing goes through the pipeline.
+# Waiting used to block the UI thread outright: adb calls, the wait for scrcpy's
+# window, the pause while a recording is finalised. The window stayed frozen for
+# seconds at a time. Every wait now runs in small slices and pumps the message
+# loop in between, so the panel keeps painting, moving and closing.
+#
+# Re-entrancy is not a worry: every click handler bails out on the Busy flag, so
+# a pumped message can never start a second action on top of a running one.
+$script:PumpUi = $false
+function Enable-UiPump  { $script:PumpUi = $true }
+function Disable-UiPump { $script:PumpUi = $false }
+function Test-UiPump    { return $script:PumpUi }
+
+function Wait-Pumped {
+    param([int]$Milliseconds)
+    $until = [DateTime]::UtcNow.AddMilliseconds($Milliseconds)
+    while ([DateTime]::UtcNow -lt $until) {
+        if (Test-UiPump) { [System.Windows.Forms.Application]::DoEvents() }
+        Start-Sleep -Milliseconds 15
+    }
+}
+
 function Invoke-Hidden {
     param([string]$FilePath, [string[]]$Arguments, [int]$TimeoutMs = 30000)
 
@@ -136,12 +198,21 @@ function Invoke-Hidden {
     $psi.RedirectStandardError  = $true
 
     $proc = [System.Diagnostics.Process]::Start($psi)
-    # Read before waiting: a full pipe buffer would otherwise deadlock us.
-    $stdout = $proc.StandardOutput.ReadToEnd()
-    [void]$proc.StandardError.ReadToEnd()
-    if (-not $proc.WaitForExit($TimeoutMs)) {
-        try { $proc.Kill() } catch { }
+    # Both pipes are drained by the framework from here on, so a full buffer
+    # cannot deadlock us and the wait below is free to run in slices.
+    $outTask = $proc.StandardOutput.ReadToEndAsync()
+    $errTask = $proc.StandardError.ReadToEndAsync()
+
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
+    while (-not $proc.HasExited -and [DateTime]::UtcNow -lt $deadline) {
+        if (Test-UiPump) { [System.Windows.Forms.Application]::DoEvents() }
+        Start-Sleep -Milliseconds 10
     }
+    if (-not $proc.HasExited) { try { $proc.Kill() } catch { } }
+
+    [void]$errTask.Wait(2000)
+    $stdout = ''
+    if ($outTask.Wait(2000)) { $stdout = $outTask.Result }
     if ([string]::IsNullOrEmpty($stdout)) { return @() }
     return @($stdout -split "`r?`n" | Where-Object { $_ -ne '' })
 }
@@ -158,13 +229,25 @@ function Invoke-Adb {
 # Like Invoke-Hidden but for something we keep running, so no redirection: an
 # undrained pipe would eventually block the child.
 function Start-Hidden {
-    param([string]$FilePath, [string[]]$Arguments)
+    param([string]$FilePath, [string[]]$Arguments, [switch]$CaptureError)
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName        = $FilePath
     $psi.Arguments       = ConvertTo-CommandLine $Arguments
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow  = $true
-    return [System.Diagnostics.Process]::Start($psi)
+    # stderr only: that is where scrcpy puts its errors. stdout carries nothing
+    # but the version banner, and in normal use there is no console for it to
+    # land in anyway.
+    if ($CaptureError) { $psi.RedirectStandardError = $true }
+
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    if ($CaptureError) {
+        # Handed to the framework to drain, so the pipe cannot fill up and stall
+        # a child that keeps running. Only read if it dies on us early.
+        Add-Member -InputObject $proc -Force -NotePropertyName ErrorTask `
+            -NotePropertyValue $proc.StandardError.ReadToEndAsync()
+    }
+    return $proc
 }
 
 function Invoke-AdbTarget {
@@ -194,7 +277,7 @@ function Get-DeviceInfo {
         if ($all.Count -gt 0) { $state = $all[0].State }
         return [pscustomobject]@{
             Ready = $false; Status = $state; Serial = $null
-            Model = $null; Android = $null; Battery = $null; Count = $all.Count
+            Model = $null; Android = $null; Battery = $null; Temperature = $null; Count = $all.Count
         }
     }
 
@@ -203,16 +286,40 @@ function Get-DeviceInfo {
         $script:Serial = $ready[0].Serial
     }
 
-    $model   = ((Invoke-AdbTarget @('shell', 'getprop', 'ro.product.model')) -join '').Trim()
-    $android = ((Invoke-AdbTarget @('shell', 'getprop', 'ro.build.version.release')) -join '').Trim()
-    $battery = $null
-    foreach ($line in (Invoke-AdbTarget @('shell', 'dumpsys', 'battery'))) {
-        if ($line -match '^\s*level:\s*(\d+)') { $battery = [int]$Matches[1] }
+    # Model and Android version cannot change under a given serial, so they are
+    # asked once per device instead of on every poll. That alone took this from
+    # four adb round trips every four seconds down to one.
+    $facts = $script:DeviceFacts[$script:Serial]
+    if (-not $facts) {
+        $facts = @{
+            Model   = ((Invoke-AdbTarget @('shell', 'getprop', 'ro.product.model')) -join '').Trim()
+            Android = ((Invoke-AdbTarget @('shell', 'getprop', 'ro.build.version.release')) -join '').Trim()
+        }
+        # Only keep an answer that actually arrived, so a hiccup is retried.
+        if ($facts.Model) { $script:DeviceFacts[$script:Serial] = $facts }
+    }
+
+    # Charge and temperature come out of this one call, so showing the temperature
+    # costs no extra round trip.
+    $age = ([DateTime]::UtcNow - $script:BatteryStamp).TotalSeconds
+    if ($script:BatterySerial -ne $script:Serial -or $age -ge $script:BatteryMaxAgeSec) {
+        foreach ($line in (Invoke-AdbTarget @('shell', 'dumpsys', 'battery'))) {
+            if ($line -match '^\s*level:\s*(\d+)') { $script:BatteryLevel = [int]$Matches[1] }
+            # Tenths of a degree, and the same figure the phone shows itself. The
+            # thermalservice sensor that is also called "battery" is a different
+            # one and reads several degrees higher.
+            if ($line -match '^\s*temperature:\s*(-?\d+)') {
+                $script:BatteryTemp = [double]$Matches[1] / 10
+            }
+        }
+        $script:BatterySerial = $script:Serial
+        $script:BatteryStamp  = [DateTime]::UtcNow
     }
 
     return [pscustomobject]@{
         Ready = $true; Status = 'device'; Serial = $script:Serial
-        Model = $model; Android = $android; Battery = $battery; Count = $ready.Count
+        Model = $facts.Model; Android = $facts.Android
+        Battery = $script:BatteryLevel; Temperature = $script:BatteryTemp; Count = $ready.Count
     }
 }
 
@@ -220,8 +327,35 @@ function Get-DeviceInfo {
 # resolves to that module rather than to this file. Script-scope state is therefore
 # read through functions, which do resolve correctly from inside a closure.
 function Get-CurrentSerial { return $script:Serial }
+# Pressing Refresh should mean now, not "up to ten seconds ago".
+function Reset-BatteryCache { $script:BatteryStamp = [DateTime]::MinValue }
 function Reset-CurrentSerial { $script:Serial = $null }
+# Self clearing: once scrcpy is gone - closed from its own window bar, device
+# unplugged, crashed - the handle is dropped and the button goes back to Start.
+function Test-MirrorActive {
+    if ($script:MirrorProc -and $script:MirrorProc.HasExited) { $script:MirrorProc = $null }
+    return [bool]$script:MirrorProc
+}
+
+function Stop-Mirror {
+    if (-not $script:MirrorProc) { return }
+    if (-not $script:MirrorProc.HasExited) {
+        # Close the window rather than killing the process: scrcpy has its own
+        # shutdown to run, and --power-off-on-close only happens on that path.
+        [void]$script:MirrorProc.CloseMainWindow()
+        $deadline = [DateTime]::UtcNow.AddSeconds(5)
+        while (-not $script:MirrorProc.HasExited -and [DateTime]::UtcNow -lt $deadline) {
+            Wait-Pumped 100
+        }
+        if (-not $script:MirrorProc.HasExited) { try { $script:MirrorProc.Kill() } catch { } }
+    }
+    $script:MirrorProc = $null
+}
+
 function Test-RecordingActive { return [bool]$script:RecordRemote }
+# True once the adb client has exited, which happens when screenrecord hits its
+# own three minute limit on the device - nobody pressed stop.
+function Test-RecordingFinished { return [bool]($script:RecordProc -and $script:RecordProc.HasExited) }
 function Get-ScrcpyPath { return $script:Tools.Scrcpy }
 
 function Get-DeviceIp {
@@ -266,12 +400,17 @@ function Start-Recording {
 
 function Stop-Recording {
     if (-not $script:RecordRemote) { throw 'No recording is running.' }
-    # screenrecord only finalises the MP4 container on SIGINT, so signal the
-    # process on the device instead of killing the adb client here.
-    Invoke-AdbTarget @('shell', 'pkill', '-INT', 'screenrecord') | Out-Null
-    Start-Sleep -Seconds 3
-    if ($script:RecordProc -and -not $script:RecordProc.HasExited) {
-        try { $script:RecordProc.Kill() } catch { }
+    # Already over the line: screenrecord stops by itself after three minutes and
+    # takes the adb client with it. Signalling and waiting again would be pure
+    # delay, and the file on the phone is finished either way.
+    if (-not (Test-RecordingFinished)) {
+        # screenrecord only finalises the MP4 container on SIGINT, so signal the
+        # process on the device instead of killing the adb client here.
+        Invoke-AdbTarget @('shell', 'pkill', '-INT', 'screenrecord') | Out-Null
+        Wait-Pumped 3000
+        if ($script:RecordProc -and -not $script:RecordProc.HasExited) {
+            try { $script:RecordProc.Kill() } catch { }
+        }
     }
     $local = Join-Path (Get-OutputDir) "recording-$($script:RecordStamp).mp4"
     Invoke-AdbTarget @('pull', $script:RecordRemote, $local) | Out-Null
@@ -310,11 +449,12 @@ function Install-ScrcpyUpdate {
 }
 
 function Start-Mirror {
-    param([int]$MaxSize, [int]$Fps, [switch]$StayAwake, [switch]$ScreenOff)
+    param([int]$MaxSize, [int]$Fps, [int]$BitRateMbit, [switch]$StayAwake, [switch]$ScreenOff)
     $argList = @()
     if ($script:Serial) { $argList += @('-s', $script:Serial) }
     if ($MaxSize -gt 0) { $argList += "--max-size=$MaxSize" }
     if ($Fps -gt 0)     { $argList += "--max-fps=$Fps" }
+    if ($BitRateMbit -gt 0) { $argList += "--video-bit-rate=${BitRateMbit}M" }
     if ($StayAwake)     { $argList += '--stay-awake' }
     if ($ScreenOff)     { $argList += @('--turn-screen-off', '--power-off-on-close') }
     # Plain value: ConvertTo-CommandLine quotes it because of the space. Quoting it
@@ -322,22 +462,42 @@ function Start-Mirror {
     $argList += '--window-title=Android Mirror'
 
     # CreateNoWindow suppresses scrcpy's console; its own SDL window is unaffected
-    # and is what we wait for below.
-    $proc = Start-Hidden -FilePath $script:Tools.Scrcpy -Arguments $argList
+    # and is what we wait for below. Its stderr is kept so a failure can be named.
+    $proc = Start-Hidden -FilePath $script:Tools.Scrcpy -Arguments $argList -CaptureError
 
     # Inheriting aside, scrcpy needs a moment before it owns a window. Wait for it
     # and pull it to the front, rather than trusting the show state alone.
-    for ($i = 0; $i -lt 25; $i++) {
-        Start-Sleep -Milliseconds 200
+    # Eight seconds: a healthy start takes about two and a half.
+    for ($i = 0; $i -lt 40; $i++) {
+        Wait-Pumped 200
         if ($proc.HasExited) { break }
         $proc.Refresh()
         if ($proc.MainWindowHandle -ne [IntPtr]::Zero) {
             [void][PanelNative]::ShowWindow($proc.MainWindowHandle, 9)   # SW_RESTORE
             [void][PanelNative]::SetForegroundWindow($proc.MainWindowHandle)
-            break
+            $script:MirrorProc = $proc
+            return $proc
         }
     }
-    return $proc
+
+    # Reporting success either way would send the user hunting for a window that
+    # never opened. scrcpy quits straight away on an unauthorised or unplugged
+    # device and says why on stderr, so pass that on instead.
+    if ($proc.HasExited) {
+        $reason = ''
+        if ($proc.ErrorTask -and $proc.ErrorTask.Wait(2000)) {
+            $reason = @($proc.ErrorTask.Result -split "`r?`n" |
+                Where-Object { $_ -match '\S' } | Select-Object -Last 1) -join ''
+        }
+        if (-not $reason) { $reason = "exit code $($proc.ExitCode)" }
+        throw "scrcpy stopped right away - $($reason.Trim())"
+    }
+
+    # Alive after the full wait but with no window: broken rather than slow. An
+    # invisible scrcpy keeps its grip on the device, and pressing the button
+    # again would stack up another one, so clear it away instead of leaving it.
+    try { $proc.Kill() } catch { }
+    throw 'scrcpy did not open a window within 8 seconds and was stopped.'
 }
 
 # --------------------------------------------------------------------- theme
@@ -578,13 +738,33 @@ function New-Panel {
     $lblDevice.BackColor = [System.Drawing.Color]::Transparent
     $cardDevice.Controls.Add($lblDevice)
 
+    # The second line is three labels rather than one string: the temperature
+    # needs a colour of its own, and it should sit right behind the charge level
+    # instead of being parked at the far edge. They size themselves and are
+    # chained left to right on every refresh, so they read as a single line.
     $lblSerial           = New-Object System.Windows.Forms.Label
     $lblSerial.Location  = New-Object System.Drawing.Point(34, 44)
-    $lblSerial.Size      = New-Object System.Drawing.Size(320, 20)
+    $lblSerial.AutoSize  = $true
     $lblSerial.ForeColor = $t.TextDim
     $lblSerial.Font      = New-Object System.Drawing.Font('Segoe UI', 8.5)
     $lblSerial.BackColor = [System.Drawing.Color]::Transparent
     $cardDevice.Controls.Add($lblSerial)
+
+    $lblTemp           = New-Object System.Windows.Forms.Label
+    $lblTemp.Location  = New-Object System.Drawing.Point(140, 44)
+    $lblTemp.AutoSize  = $true
+    $lblTemp.ForeColor = $t.TextDim
+    $lblTemp.Font      = New-Object System.Drawing.Font('Segoe UI Semibold', 8.5)
+    $lblTemp.BackColor = [System.Drawing.Color]::Transparent
+    $cardDevice.Controls.Add($lblTemp)
+
+    $lblSerialRest           = New-Object System.Windows.Forms.Label
+    $lblSerialRest.Location  = New-Object System.Drawing.Point(200, 44)
+    $lblSerialRest.AutoSize  = $true
+    $lblSerialRest.ForeColor = $t.TextDim
+    $lblSerialRest.Font      = New-Object System.Drawing.Font('Segoe UI', 8.5)
+    $lblSerialRest.BackColor = [System.Drawing.Color]::Transparent
+    $cardDevice.Controls.Add($lblSerialRest)
 
     # Glyph-only button, so the icon font does not affect any label text.
     $btnRefresh = New-FlatButton $t ([char]0xE72C) 366 24 38 30 -FontName 'Segoe MDL2 Assets' -FontSize 10
@@ -595,7 +775,7 @@ function New-Panel {
     # ---------------------------------------------------------- mirror card
     $form.Controls.Add((New-SectionLabel $t 'Mirror' ($pad + 2) $y))
     $y += 18
-    $cardMirror = New-Card $t $pad $y $inner 126
+    $cardMirror = New-Card $t $pad $y $inner 160
     $form.Controls.Add($cardMirror)
 
     $lblSize           = New-Object System.Windows.Forms.Label
@@ -622,9 +802,32 @@ function New-Panel {
     $cmbFps = New-ThemedDropdown $t 274 18 90 @('60', '30', '24') ([string]$Fps)
     $cardMirror.Controls.Add($cmbFps)
 
+    $lblRate           = New-Object System.Windows.Forms.Label
+    $lblRate.Text      = 'Bit rate'
+    $lblRate.Location  = New-Object System.Drawing.Point(16, 56)
+    $lblRate.Size      = New-Object System.Drawing.Size(58, 20)
+    $lblRate.ForeColor = $t.TextDim
+    $lblRate.BackColor = [System.Drawing.Color]::Transparent
+    $cardMirror.Controls.Add($lblRate)
+
+    $cmbRate = New-ThemedDropdown $t 78 52 108 `
+        @('8 Mbit', '16 Mbit', '24 Mbit', '32 Mbit') "$BitRate Mbit"
+    $cardMirror.Controls.Add($cmbRate)
+
+    # Both directions are real: more bits sharpen a scrolling page, but they also
+    # load the phone's encoder, and in a game that costs responsiveness.
+    $lblRateHint           = New-Object System.Windows.Forms.Label
+    $lblRateHint.Text      = 'Higher is sharper, lower is smoother'
+    $lblRateHint.Location  = New-Object System.Drawing.Point(196, 56)
+    $lblRateHint.Size      = New-Object System.Drawing.Size(210, 20)
+    $lblRateHint.ForeColor = $t.TextDim
+    $lblRateHint.Font      = New-Object System.Drawing.Font('Segoe UI', 8)
+    $lblRateHint.BackColor = [System.Drawing.Color]::Transparent
+    $cardMirror.Controls.Add($lblRateHint)
+
     $chkAwake           = New-Object System.Windows.Forms.CheckBox
     $chkAwake.Text      = 'Keep device awake'
-    $chkAwake.Location  = New-Object System.Drawing.Point(16, 54)
+    $chkAwake.Location  = New-Object System.Drawing.Point(16, 88)
     $chkAwake.Size      = New-Object System.Drawing.Size(170, 24)
     $chkAwake.Checked   = $true
     $chkAwake.ForeColor = $t.Text
@@ -635,17 +838,17 @@ function New-Panel {
 
     $chkScreenOff           = New-Object System.Windows.Forms.CheckBox
     $chkScreenOff.Text      = 'Phone screen off'
-    $chkScreenOff.Location  = New-Object System.Drawing.Point(214, 54)
+    $chkScreenOff.Location  = New-Object System.Drawing.Point(214, 88)
     $chkScreenOff.Size      = New-Object System.Drawing.Size(170, 24)
     $chkScreenOff.Checked   = [bool]$ScreenOff
     $chkScreenOff.ForeColor = $t.Text
     $chkScreenOff.BackColor = [System.Drawing.Color]::Transparent
     $cardMirror.Controls.Add($chkScreenOff)
 
-    $btnMirror = New-FlatButton $t 'Start mirroring' 16 84 388 32 -Primary -FontSize 9.5
+    $btnMirror = New-FlatButton $t 'Start mirroring' 16 118 388 32 -Primary -FontSize 9.5
     $cardMirror.Controls.Add($btnMirror)
 
-    $y += 126 + 18
+    $y += 160 + 18
 
     # --------------------------------------------------------- capture card
     $form.Controls.Add((New-SectionLabel $t 'Capture' ($pad + 2) $y))
@@ -726,6 +929,15 @@ function New-Panel {
     # silently clips the last card and the status line off the bottom.
     $form.ClientSize = New-Object System.Drawing.Size(($inner + 2 * $pad), ($y + 44))
 
+    # Down the left edge instead of centred. scrcpy puts its own window in the
+    # middle of the screen, which landed exactly on top of a centred panel and
+    # hid it completely the moment mirroring started.
+    $work = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+    $form.StartPosition = 'Manual'
+    $form.Location = New-Object System.Drawing.Point(
+        ($work.Left + 24),
+        ($work.Top + [Math]::Max(0, [int](($work.Height - $form.Height) / 2))))
+
     # ------------------------------------------------------------ behaviour
 
     # One shared bag for everything the handlers touch. Closures capture variables
@@ -741,7 +953,7 @@ function New-Panel {
             Folder  = $btnFolder;  Wireless = $btnWireless; Usb = $btnUsb
             Update  = $btnUpdate;  Apk = $btnApk
         }
-        Combos = @{ Size = $cmbSize; Fps = $cmbFps }
+        Combos = @{ Size = $cmbSize; Fps = $cmbFps; Rate = $cmbRate }
         Checks = @{ Awake = $chkAwake; ScreenOff = $chkScreenOff }
     }
 
@@ -749,6 +961,10 @@ function New-Panel {
     # whatever scope invokes it, and would not find $status from a handler.
     $setStatus = {
         param([string]$Text, $Color)
+        # The window can now be closed mid action, because waiting no longer
+        # freezes it. Whatever was running carries on for a moment afterwards
+        # and must not touch controls that are already gone.
+        if ($ui.Status.IsDisposed) { return }
         if ($null -eq $Color) { $Color = $ui.Theme.Text }
         $ui.Status.Text      = $Text
         $ui.Status.ForeColor = $Color
@@ -757,9 +973,15 @@ function New-Panel {
 
     $deviceButtons = @($btnMirror, $btnShot, $btnRec, $btnWireless, $btnUsb, $btnApk)
 
+    # Force is for the callers that run inside runGuarded: that sets Busy before
+    # handing over, so without it the poll guard below would turn their refresh
+    # into a silent no-op - which is exactly what the Refresh button used to do.
     $refresh = {
-        if ($ui.Busy) { return }
+        param([switch]$Force)
+        if ($form.IsDisposed) { return }
+        if ($ui.Busy -and -not $Force) { return }
         $info = Get-DeviceInfo
+        if ($form.IsDisposed) { return }
         if ($info.Ready) {
             $battery = ''
             if ($null -ne $info.Battery) { $battery = "   $($info.Battery)%" }
@@ -767,7 +989,30 @@ function New-Panel {
             $dotState.Color  = $ui.Theme.Ok
             $extra = ''
             if ($info.Count -gt 1) { $extra = "   -   $($info.Count) devices, using this one" }
-            $lblSerial.Text = "Android $($info.Android)$battery   -   $($info.Serial)$extra"
+            $lblSerial.Text = "Android $($info.Android)$battery"
+
+            # Dimmed while it is unremarkable, amber once it is warm, red when
+            # the phone is hot enough to start throttling.
+            if ($null -ne $info.Temperature) {
+                $lblTemp.Text = '{0} {1}C' -f `
+                    ([string]::Format([cultureinfo]::InvariantCulture, '{0:0.0}', $info.Temperature)),
+                    ([char]0x00B0)
+                if     ($info.Temperature -ge 45) { $lblTemp.ForeColor = $ui.Theme.Bad }
+                elseif ($info.Temperature -ge 40) { $lblTemp.ForeColor = $ui.Theme.Warn }
+                else                              { $lblTemp.ForeColor = $ui.Theme.TextDim }
+            } else {
+                $lblTemp.Text = ''
+            }
+            $lblSerialRest.Text = "-   $($info.Serial)$extra"
+
+            # PreferredWidth rather than Width: it is the size the label will
+            # take for the text just assigned, without waiting for a layout pass.
+            $lblTemp.Left = $lblSerial.Left + $lblSerial.PreferredWidth + 10
+            if ($lblTemp.Text) {
+                $lblSerialRest.Left = $lblTemp.Left + $lblTemp.PreferredWidth + 10
+            } else {
+                $lblSerialRest.Left = $lblTemp.Left
+            }
             foreach ($b in $deviceButtons) { $b.Enabled = $true }
         } else {
             $text = 'No device connected'
@@ -777,8 +1022,10 @@ function New-Panel {
                 $dotState.Color = $ui.Theme.Warn
             }
             if ($info.Status -eq 'offline') { $text = 'Device offline' }
-            $lblDevice.Text = $text
-            $lblSerial.Text = 'Enable USB debugging and confirm the prompt on the phone.'
+            $lblDevice.Text      = $text
+            $lblSerial.Text      = 'Enable USB debugging and confirm the prompt on the phone.'
+            $lblTemp.Text        = ''
+            $lblSerialRest.Text  = ''
             foreach ($b in $deviceButtons) { $b.Enabled = $false }
         }
         $dot.Invalidate()
@@ -792,7 +1039,7 @@ function New-Panel {
 
     $runGuarded = {
         param([scriptblock]$Work, [string]$Running)
-        if ($ui.Busy) { return }
+        if ($ui.Busy -or $form.IsDisposed) { return }
         $ui.Busy = $true
         $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
         & $setStatus $Running $null
@@ -801,21 +1048,47 @@ function New-Panel {
         } catch {
             & $setStatus "Failed: $($_.Exception.Message)" $ui.Theme.Bad
         } finally {
-            $form.Cursor = [System.Windows.Forms.Cursors]::Default
+            if (-not $form.IsDisposed) { $form.Cursor = [System.Windows.Forms.Cursors]::Default }
             $ui.Busy = $false
         }
     }.GetNewClosure()
 
+    # The button follows the actual state of scrcpy, so it also flips back on its
+    # own when the mirror window is closed by its own X or the cable comes out.
+    $syncMirror = {
+        if ($form.IsDisposed) { return }
+        if (Test-MirrorActive) { $btnMirror.Text = 'Stop mirroring' }
+        else                   { $btnMirror.Text = 'Start mirroring' }
+    }.GetNewClosure()
+
     $btnRefresh.Add_Click({
-        & $runGuarded { & $refresh; & $setStatus 'Refreshed.' $null } 'Reading device ...'
+        & $runGuarded {
+            Reset-BatteryCache
+            & $refresh -Force
+            & $setStatus 'Refreshed.' $null
+        } 'Reading device ...'
     }.GetNewClosure())
 
+    # One mirror window at a time. Pressing this repeatedly used to stack up a
+    # new scrcpy on every click; now the second press closes the one that is up.
     $btnMirror.Add_Click({
+        if (Test-MirrorActive) {
+            & $runGuarded {
+                Stop-Mirror
+                & $syncMirror
+                & $setStatus 'Mirroring stopped.' $null
+            } 'Closing the mirror window ...'
+            return
+        }
         & $runGuarded {
             $size = 0
             if ($cmbSize.Tag -ne 'Original') { $size = [int]$cmbSize.Tag }
-            Start-Mirror -MaxSize $size -Fps ([int]$cmbFps.Tag) `
+            # Tag reads like "24 Mbit"; scrcpy wants just the number.
+            $rate = [int](($cmbRate.Tag -split ' ')[0])
+            # Start-Mirror either comes back with a window on screen or raises.
+            Start-Mirror -MaxSize $size -Fps ([int]$cmbFps.Tag) -BitRateMbit $rate `
                 -StayAwake:$chkAwake.Checked -ScreenOff:$chkScreenOff.Checked | Out-Null
+            & $syncMirror
             & $setStatus 'scrcpy started.' $null
         } 'Starting scrcpy ...'
     }.GetNewClosure())
@@ -857,7 +1130,7 @@ function New-Panel {
             $ip = Get-DeviceIp
             if (-not $ip) { throw 'No Wi-Fi address found. Is the phone on Wi-Fi?' }
             Invoke-AdbTarget @('tcpip', '5555') | Out-Null
-            Start-Sleep -Seconds 2
+            Wait-Pumped 2000
             $out = Invoke-Adb @('connect', "${ip}:5555")
             & $setStatus (($out -join ' ').Trim()) $null
         } 'Switching to wireless ...'
@@ -868,7 +1141,7 @@ function New-Panel {
             Invoke-Adb @('disconnect') | Out-Null
             Invoke-AdbTarget @('usb') | Out-Null
             Reset-CurrentSerial
-            & $refresh
+            & $refresh -Force
             & $setStatus 'Back to USB only.' $null
         } 'Returning to USB ...'
     }.GetNewClosure())
@@ -903,10 +1176,26 @@ function New-Panel {
         } 'Installing APK ...'
     }.GetNewClosure())
 
+    # screenrecord stops by itself after three minutes and the adb client exits
+    # with it. Without noticing that, the button would keep offering "Stop
+    # recording" for a file that is long finished and still on the phone.
+    $checkRecording = {
+        if ($ui.Busy -or $form.IsDisposed) { return }
+        if (-not (Test-RecordingActive) -or -not (Test-RecordingFinished)) { return }
+        & $runGuarded {
+            $file = Stop-Recording
+            $btnRec.Text = 'Start recording'
+            & $setStatus "Recording hit the 3 min limit, saved $(Split-Path -Leaf $file)" $null
+        } 'Recording finished, pulling ...'
+    }.GetNewClosure()
+
     # -StartMirror fires once, and only when a device is genuinely ready, so
     # plugging the cable in after opening the panel still works.
     $tryAutoStart = {
         if (-not $ui.AutoStartPending) { return }
+        # The button toggles now, so firing it while a mirror is already up would
+        # close that one instead of opening anything.
+        if (Test-MirrorActive) { $ui.AutoStartPending = $false; return }
         if ($ui.Busy -or -not (Get-CurrentSerial) -or -not $btnMirror.Enabled) { return }
         $ui.AutoStartPending = $false
         $btnMirror.PerformClick()
@@ -915,7 +1204,7 @@ function New-Panel {
     # Poll so the panel notices a cable being plugged in or pulled.
     $timer          = New-Object System.Windows.Forms.Timer
     $timer.Interval = 4000
-    $timer.Add_Tick({ & $refresh; & $tryAutoStart }.GetNewClosure())
+    $timer.Add_Tick({ & $refresh; & $syncMirror; & $checkRecording; & $tryAutoStart }.GetNewClosure())
 
     # Startup blocks for seconds: Get-DeviceInfo makes four adb round trips, and
     # -StartMirror then waits for scrcpy's window to exist. Doing that straight
@@ -931,6 +1220,9 @@ function New-Panel {
         # First statement, before anything that could throw: a form left at
         # opacity 0 would be invisible for good.
         $form.Opacity    = 1
+        # From here on there is a message loop to pump, so waiting stops
+        # freezing the window.
+        Enable-UiPump
         $form.Cursor     = [System.Windows.Forms.Cursors]::WaitCursor
         $lblVersion.Text = Get-ScrcpyPath
         & $refresh
@@ -956,6 +1248,8 @@ function New-Panel {
     $form.Add_FormClosing({
         $boot.Stop()
         $timer.Stop()
+        # No loop left worth pumping once the window is going away.
+        Disable-UiPump
         if (Test-RecordingActive) {
             # Do not leave a half-written file sitting on the phone.
             try { Stop-Recording | Out-Null } catch { }
@@ -984,11 +1278,24 @@ if ($SelfTest) {
     $devices = @(Get-Devices)
     Write-Host ("devices    : {0}" -f (($devices | ForEach-Object { "$($_.Serial)=$($_.State)" }) -join ', '))
     $info = Get-DeviceInfo
-    Write-Host ("info       : ready=$($info.Ready) model='$($info.Model)' android=$($info.Android) battery=$($info.Battery) count=$($info.Count)")
+    Write-Host ("info       : ready=$($info.Ready) model='$($info.Model)' android=$($info.Android) battery=$($info.Battery) temp=$($info.Temperature) count=$($info.Count)")
     Write-Host ("output dir : {0}" -f (Get-OutputDir))
     $upd = Test-ScrcpyUpdate
     Write-Host ("update     : available=$($upd.Available) reason='$($upd.Reason)'")
     if ($info.Ready) { Write-Host ("wlan ip    : {0}" -f (Get-DeviceIp)) }
+
+    # A GUI cannot be clicked headlessly, so the one path that used to lie about
+    # its outcome is checked here: scrcpy against a device that does not exist
+    # must come back as an error, not as "started".
+    $keepSerial = $script:Serial
+    $script:Serial = 'no-such-device'
+    try {
+        [void](Start-Mirror -MaxSize 0 -Fps 0)
+        Write-Host 'failure    : NOT REPORTED - scrcpy died and nobody noticed' -ForegroundColor Red
+    } catch {
+        Write-Host ("failure    : reported as '{0}'" -f $_.Exception.Message)
+    }
+    $script:Serial = $keepSerial
 
     Write-Host '--- building the form (not shown) ---' -ForegroundColor Cyan
     $form = New-Panel
@@ -1005,7 +1312,7 @@ if ($SelfTest) {
     Write-Host ("buttons    : {0}" -f (($ui.Buttons.Values | ForEach-Object { $_.Text }) -join ', '))
 
     # Prove the -MaxSize/-Fps/-ScreenOff parameters actually reached the controls.
-    $picked = "$($ui.Combos.Size.Tag) / $($ui.Combos.Fps.Tag)"
+    $picked = "$($ui.Combos.Size.Tag) / $($ui.Combos.Fps.Tag) fps / $($ui.Combos.Rate.Tag)"
     $ticked = ($ui.Checks.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value.Checked)" }) -join ', '
     Write-Host ("mirror set : $picked   [$ticked]")
     Write-Host ("auto start : {0}" -f $ui.AutoStartPending)
@@ -1015,4 +1322,5 @@ if ($SelfTest) {
 }
 
 Hide-OwnConsole
+if (-not (Request-SingleInstance)) { exit 0 }
 [void][System.Windows.Forms.Application]::Run((New-Panel))
